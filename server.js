@@ -17,13 +17,31 @@ const HEADLESS = process.env.HEADLESS !== 'false';
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '3');
 const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '300000');
+const SESSION_MAX = parseInt(process.env.SESSION_MAX || '100');
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || '3');
 const PROXY = process.env.PROXY || null;
 const REQUEST_TIMEOUT_MS = NAV_TIMEOUT_MS + 5000; // Server timeout buffer
 
 // Default headers for stealth
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
+
+// Cloudflare-specific headers
+const CF_HEADERS = {
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Not.A/Brand";v="24", "Google Chrome";v="124"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1'
+};
 
 // Logger setup
 const logger = pino({
@@ -40,9 +58,8 @@ let isReady = false;
 let isShuttingDown = false;
 let server = null;
 
-// Session management
-const sessions = new Map();
-const sessionLastAccess = new Map();
+// Session management with proper pooling
+const sessions = new Map(); // Map<sessionId, { context, lastUsedAt, createdAt }>
 
 // Error taxonomy
 class ServiceError extends Error {
@@ -59,7 +76,8 @@ const ErrorTypes = {
   TIMEOUT: (msg, hint) => new ServiceError('TIMEOUT', msg, hint),
   PAGE_ERROR: (msg, hint) => new ServiceError('PAGE_ERROR', msg, hint),
   BROWSER_ERROR: (msg, hint) => new ServiceError('BROWSER_ERROR', msg, hint),
-  INTERNAL: (msg, hint) => new ServiceError('INTERNAL', msg, hint)
+  INTERNAL: (msg, hint) => new ServiceError('INTERNAL', msg, hint),
+  CF_CHALLENGE: (msg, hint) => new ServiceError('CF_CHALLENGE', msg, hint)
 };
 
 // Utility: random delay
@@ -77,6 +95,45 @@ const generateRequestId = () => {
     const v = c === 'x' ? r : (r & 0x3 | 0x8);
     return v.toString(16);
   });
+};
+
+// Check if URL needs Cloudflare hardening
+const needsCfHardening = (url, challengeMode) => {
+  if (challengeMode) return true;
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return /(partsouq\.com|cf|cloudflare)/i.test(hostname);
+  } catch {
+    return false;
+  }
+};
+
+// LRU eviction for sessions
+const evictLRUSession = async () => {
+  if (sessions.size === 0) return;
+  
+  let oldestId = null;
+  let oldestTime = Date.now();
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.lastUsedAt < oldestTime) {
+      oldestTime = session.lastUsedAt;
+      oldestId = sessionId;
+    }
+  }
+  
+  if (oldestId) {
+    const session = sessions.get(oldestId);
+    logger.info({ sessionId: oldestId }, 'Evicting LRU session due to SESSION_MAX limit');
+    
+    try {
+      await session.context.close();
+    } catch (err) {
+      logger.error({ err: err.message, sessionId: oldestId }, 'Error closing evicted session');
+    }
+    
+    sessions.delete(oldestId);
+  }
 };
 
 // Concurrency control semaphore
@@ -167,21 +224,40 @@ const contextPool = genericPool.createPool({
   idleTimeoutMillis: 60000
 });
 
-// Session cleanup task
-const sessionCleanupInterval = setInterval(() => {
+// Session cleanup task - runs every 60 seconds
+const sessionCleanupInterval = setInterval(async () => {
   const now = Date.now();
-  for (const [sessionId, lastAccess] of sessionLastAccess.entries()) {
-    if (now - lastAccess > SESSION_TTL_MS) {
-      logger.info({ sessionId }, 'Cleaning expired session');
-      const context = sessions.get(sessionId);
-      if (context) {
-        context.close().catch(err => 
-          logger.error({ err, sessionId }, 'Error closing session context')
-        );
-      }
-      sessions.delete(sessionId);
-      sessionLastAccess.delete(sessionId);
+  const toDelete = [];
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    const age = now - session.lastUsedAt;
+    if (age > SESSION_TTL_MS) {
+      toDelete.push(sessionId);
     }
+  }
+  
+  for (const sessionId of toDelete) {
+    const session = sessions.get(sessionId);
+    logger.info({ 
+      sessionId, 
+      age: Math.round((now - session.createdAt) / 1000) + 's',
+      idle: Math.round((now - session.lastUsedAt) / 1000) + 's'
+    }, 'Cleaning expired session');
+    
+    try {
+      await session.context.close();
+    } catch (err) {
+      logger.error({ err: err.message, sessionId }, 'Error closing expired session');
+    }
+    
+    sessions.delete(sessionId);
+  }
+  
+  if (toDelete.length > 0) {
+    logger.info({ 
+      cleaned: toDelete.length, 
+      remaining: sessions.size 
+    }, 'Session cleanup completed');
   }
 }, 60000); // Run every minute
 
@@ -233,6 +309,35 @@ app.get('/version', (req, res) => {
     uptime: process.uptime(),
     env: process.env.NODE_ENV || 'production',
     ready: isReady
+  });
+});
+
+// Admin endpoint for session monitoring
+app.get('/sessions', (req, res) => {
+  const now = Date.now();
+  const sessionInfo = [];
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    sessionInfo.push({
+      sessionId: sessionId.substring(0, 8) + '...', // Mask sensitive data
+      createdAt: new Date(session.createdAt).toISOString(),
+      lastUsedAt: new Date(session.lastUsedAt).toISOString(),
+      ageSeconds: Math.round((now - session.createdAt) / 1000),
+      idleSeconds: Math.round((now - session.lastUsedAt) / 1000),
+      ttlRemaining: Math.max(0, Math.round((SESSION_TTL_MS - (now - session.lastUsedAt)) / 1000))
+    });
+  }
+  
+  // Sort by last used (most recent first)
+  sessionInfo.sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+  
+  res.json({
+    totalSessions: sessions.size,
+    maxSessions: SESSION_MAX,
+    ttlMs: SESSION_TTL_MS,
+    poolSize: POOL_SIZE,
+    poolAvailable: contextPool.available,
+    sessions: sessionInfo
   });
 });
 
@@ -312,15 +417,16 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-// Main solve endpoint with timeout
+// Main solve endpoint with timeout and CF protection
 app.post('/solve', async (req, res) => {
   const { 
     url, 
     userAgent, 
     cookies, 
-    waitUntil = 'domcontentloaded', 
+    waitUntil, 
     sessionId, 
-    blockAssets = true 
+    blockAssets = true,
+    challengeMode = false 
   } = req.body;
   
   // Input validation
@@ -333,8 +439,10 @@ app.post('/solve', async (req, res) => {
   }
   
   // URL validation
+  let hostname;
   try {
-    new URL(url);
+    const urlObj = new URL(url);
+    hostname = urlObj.hostname;
   } catch (error) {
     return res.status(400).json({
       code: 'BAD_REQUEST',
@@ -343,11 +451,23 @@ app.post('/solve', async (req, res) => {
     });
   }
 
+  // Check if CF hardening needed
+  const cfHardening = needsCfHardening(url, challengeMode);
+  
+  // Override settings for CF-protected sites
+  const effectiveBlockAssets = cfHardening ? false : blockAssets;
+  const effectiveWaitUntil = cfHardening ? (waitUntil || 'networkidle') : (waitUntil || 'domcontentloaded');
+  const effectiveUserAgent = userAgent || DEFAULT_USER_AGENT;
+
   logger.info({ 
     requestId: req.id, 
-    url, 
+    url,
+    hostname,
     sessionId, 
-    blockAssets,
+    blockAssets: effectiveBlockAssets,
+    waitUntil: effectiveWaitUntil,
+    challengeMode,
+    cfHardening,
     userAgent: userAgent ? 'custom' : 'default'
   }, 'Processing request');
   
@@ -369,37 +489,66 @@ app.post('/solve', async (req, res) => {
   const processRequest = async () => {
     await semaphore.acquire();
     
-    // Session handling
+    // Session handling with proper pooling
     if (sessionId) {
-      context = sessions.get(sessionId);
-      if (context) {
-        sessionLastAccess.set(sessionId, Date.now());
-        logger.debug({ sessionId }, 'Reusing session context');
+      const existingSession = sessions.get(sessionId);
+      
+      if (existingSession) {
+        // Update last used time
+        existingSession.lastUsedAt = Date.now();
+        context = existingSession.context;
+        logger.debug({ 
+          sessionId,
+          age: Math.round((Date.now() - existingSession.createdAt) / 1000) + 's'
+        }, 'Reusing existing session');
       } else {
-        // Create new session context with stealth settings
+        // Check if we're at max sessions
+        if (sessions.size >= SESSION_MAX) {
+          await evictLRUSession();
+        }
+        
+        // Create new session context with CF-optimized settings
         const contextOptions = {
-          userAgent: userAgent || DEFAULT_USER_AGENT,
+          userAgent: effectiveUserAgent,
           locale: 'en-US',
-          timezoneId: 'America/New_York',
+          timezoneId: cfHardening ? 'America/New_York' : 'America/New_York',
           viewport: { width: 1920, height: 1080 },
           screen: { width: 1920, height: 1080 },
           deviceScaleFactor: 1,
           hasTouch: false,
-          extraHTTPHeaders: {
+          extraHTTPHeaders: cfHardening ? CF_HEADERS : {
             'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
           }
         };
         if (PROXY) contextOptions.proxy = { server: PROXY };
         
         context = await browser.newContext(contextOptions);
-        sessions.set(sessionId, context);
-        sessionLastAccess.set(sessionId, Date.now());
-        logger.debug({ sessionId }, 'Created new session context');
+        
+        // Store session with metadata
+        const now = Date.now();
+        sessions.set(sessionId, {
+          context,
+          createdAt: now,
+          lastUsedAt: now
+        });
+        
+        logger.debug({ 
+          sessionId,
+          totalSessions: sessions.size
+        }, 'Created new session');
       }
+      
+      // Sessions are never returned to the generic pool
+      fromPool = false;
     } else {
-      // Use pooled context
+      // Use pooled context for non-session requests
       context = await contextPool.acquire();
       fromPool = true;
+      
+      // Apply CF headers if needed for pooled context
+      if (cfHardening) {
+        await context.setExtraHTTPHeaders(CF_HEADERS);
+      }
     }
     
     // Create page
@@ -413,21 +562,25 @@ app.post('/solve', async (req, res) => {
       });
     }
     
-    // Set realistic headers
-    await page.setExtraHTTPHeaders({
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1'
-    });
+    // Set realistic headers based on CF hardening
+    if (cfHardening) {
+      await page.setExtraHTTPHeaders(CF_HEADERS);
+    } else {
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
+      });
+    }
     
     // Set cookies if provided
     if (cookies && Array.isArray(cookies)) {
@@ -443,8 +596,8 @@ app.post('/solve', async (req, res) => {
       await context.addCookies(formattedCookies);
     }
     
-    // Enhanced asset blocking
-    if (blockAssets) {
+    // Enhanced asset blocking (disabled for CF sites)
+    if (effectiveBlockAssets) {
       await page.route('**/*', (route) => {
         const resourceType = route.request().resourceType();
         const blockedTypes = ['image', 'media', 'font', 'stylesheet', 'websocket'];
@@ -462,7 +615,7 @@ app.post('/solve', async (req, res) => {
     let response;
     try {
       response = await page.goto(url, {
-        waitUntil: waitUntil,
+        waitUntil: effectiveWaitUntil,
         timeout: NAV_TIMEOUT_MS
       });
     } catch (error) {
@@ -478,27 +631,114 @@ app.post('/solve', async (req, res) => {
       );
     }
     
-    // Add human-like behavior
-    try {
-      // Small random delay
-      await randomDelay(20, 80);
+    // Enhanced humanization for CF sites
+    if (cfHardening) {
+      // Longer wait for CF sites
+      await page.waitForTimeout(600 + Math.floor(Math.random() * 800));
       
-      // Tiny scroll to trigger lazy loading
-      await page.evaluate(() => {
-        window.scrollBy(0, Math.random() * 100 + 50);
-      });
+      // Human-like scroll
+      try {
+        await page.evaluate(() => window.scrollBy(0, 120));
+      } catch (err) {
+        logger.debug({ err: err.message }, 'Scroll action failed (non-critical)');
+      }
       
-      // Another small delay
-      await randomDelay(20, 80);
+      // Small mouse movement
+      try {
+        await page.mouse.move(200, 200, { steps: 4 });
+      } catch (err) {
+        logger.debug({ err: err.message }, 'Mouse move failed (non-critical)');
+      }
       
-      // Scroll back up slightly
-      await page.evaluate(() => {
-        window.scrollBy(0, -(Math.random() * 30 + 10));
-      });
+      // Cloudflare challenge detection and wait loop
+      let challengeIterations = 0;
+      const maxChallengeIterations = 2;
       
-    } catch (err) {
-      // Ignore errors from human-like actions
-      logger.debug({ err: err.message }, 'Human-like action failed (non-critical)');
+      while (challengeIterations < maxChallengeIterations) {
+        // Check for CF challenge
+        const title = await page.title().catch(() => '');
+        const bodyText = await page.evaluate(() => 
+          document.body ? document.body.innerText.slice(0, 2000) : ''
+        ).catch(() => '');
+        
+        const challenged = /just a moment|checking your browser|cf-browser-verification|cloudflare/i.test(title + ' ' + bodyText);
+        
+        if (challenged) {
+          logger.info({ 
+            requestId: req.id, 
+            hostname,
+            iteration: challengeIterations + 1
+          }, 'Cloudflare challenge detected, waiting...');
+          
+          // Wait for CF to process
+          await page.waitForTimeout(3500);
+          
+          // Try to wait for navigation
+          try {
+            await page.waitForNavigation({ 
+              waitUntil: 'networkidle', 
+              timeout: 15000 
+            });
+          } catch (navErr) {
+            logger.debug({ 
+              err: navErr.message,
+              iteration: challengeIterations + 1
+            }, 'Navigation wait timeout (may be normal)');
+          }
+          
+          challengeIterations++;
+        } else {
+          // Challenge cleared or not present
+          if (challengeIterations > 0) {
+            logger.info({ 
+              requestId: req.id,
+              hostname,
+              iterations: challengeIterations
+            }, 'Cloudflare challenge cleared');
+          }
+          break;
+        }
+      }
+      
+      // Final check if still challenged
+      if (challengeIterations >= maxChallengeIterations) {
+        const finalTitle = await page.title().catch(() => '');
+        const finalBodyText = await page.evaluate(() => 
+          document.body ? document.body.innerText.slice(0, 2000) : ''
+        ).catch(() => '');
+        
+        const stillChallenged = /just a moment|checking your browser|cf-browser-verification|cloudflare/i.test(finalTitle + ' ' + finalBodyText);
+        
+        if (stillChallenged) {
+          throw ErrorTypes.CF_CHALLENGE(
+            'Cloudflare challenge could not be bypassed',
+            'Try using a residential proxy, enabling challengeMode, increasing NAV_TIMEOUT_MS, or reusing a sessionId'
+          );
+        }
+      }
+    } else {
+      // Standard humanization for non-CF sites
+      try {
+        // Small random delay
+        await randomDelay(20, 80);
+        
+        // Tiny scroll to trigger lazy loading
+        await page.evaluate(() => {
+          window.scrollBy(0, Math.random() * 100 + 50);
+        });
+        
+        // Another small delay
+        await randomDelay(20, 80);
+        
+        // Scroll back up slightly
+        await page.evaluate(() => {
+          window.scrollBy(0, -(Math.random() * 30 + 10));
+        });
+        
+      } catch (err) {
+        // Ignore errors from human-like actions
+        logger.debug({ err: err.message }, 'Human-like action failed (non-critical)');
+      }
     }
     
     // Wait a bit for any lazy-loaded content
@@ -534,10 +774,13 @@ app.post('/solve', async (req, res) => {
       finalUrl: result.finalUrl,
       status: result.status,
       duration,
-      blockAssets,
-      waitUntil,
+      blockAssets: effectiveBlockAssets,
+      waitUntil: effectiveWaitUntil,
       sessionId: sessionId || null,
-      poolAvailable: contextPool.available
+      sessionsActive: sessions.size,
+      poolAvailable: contextPool.available,
+      cfHardening,
+      challengeMode
     };
     
     logger.info(metrics, 'Request completed');
@@ -577,6 +820,9 @@ app.post('/solve', async (req, res) => {
         case 'BROWSER_ERROR':
           statusCode = 502;
           break;
+        case 'CF_CHALLENGE':
+          statusCode = 403;
+          break;
         default:
           statusCode = 500;
       }
@@ -585,10 +831,13 @@ app.post('/solve', async (req, res) => {
     logger.error({ 
       requestId: req.id, 
       url,
+      hostname,
       code: errorResponse.code,
       error: error.message,
       stack: error.stack,
-      duration 
+      duration,
+      cfHardening,
+      challengeMode
     }, 'Request failed');
     
     res.status(statusCode).json(errorResponse);
@@ -601,9 +850,11 @@ app.post('/solve', async (req, res) => {
       );
     }
     
+    // Only release context back to pool if it's not a session
     if (fromPool && context) {
       contextPool.release(context);
     }
+    // Session contexts are NOT returned to pool - they remain reserved
     
     semaphore.release();
   }
@@ -630,7 +881,9 @@ async function start() {
         '--hide-scrollbars',
         '--mute-audio',
         '--disable-web-security',
-        '--disable-infobars'
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-maximized'
       ]
     };
     
