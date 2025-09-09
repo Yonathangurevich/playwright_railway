@@ -19,6 +19,7 @@ const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '300000');
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || '3');
 const PROXY = process.env.PROXY || null;
+const REQUEST_TIMEOUT_MS = NAV_TIMEOUT_MS + 5000; // Server timeout buffer
 
 // Default headers for stealth
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -33,18 +34,48 @@ const logger = pino({
   } : undefined
 });
 
-// Global browser instance
+// Service state
 let browser = null;
+let isReady = false;
+let isShuttingDown = false;
+let server = null;
 
 // Session management
 const sessions = new Map();
 const sessionLastAccess = new Map();
+
+// Error taxonomy
+class ServiceError extends Error {
+  constructor(code, message, hint) {
+    super(message);
+    this.code = code;
+    this.hint = hint;
+    this.name = 'ServiceError';
+  }
+}
+
+const ErrorTypes = {
+  BAD_REQUEST: (msg, hint) => new ServiceError('BAD_REQUEST', msg, hint),
+  TIMEOUT: (msg, hint) => new ServiceError('TIMEOUT', msg, hint),
+  PAGE_ERROR: (msg, hint) => new ServiceError('PAGE_ERROR', msg, hint),
+  BROWSER_ERROR: (msg, hint) => new ServiceError('BROWSER_ERROR', msg, hint),
+  INTERNAL: (msg, hint) => new ServiceError('INTERNAL', msg, hint)
+};
 
 // Utility: random delay
 const randomDelay = (min, max) => {
   return new Promise(resolve => {
     const delay = Math.floor(Math.random() * (max - min + 1)) + min;
     setTimeout(resolve, delay);
+  });
+};
+
+// Utility: UUID v4 generator
+const generateRequestId = () => {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
   });
 };
 
@@ -71,6 +102,21 @@ class Semaphore {
       const resolve = this.queue.shift();
       resolve();
     }
+  }
+
+  drain() {
+    return new Promise((resolve) => {
+      if (this.current === 0) {
+        resolve();
+      } else {
+        const checkDrained = setInterval(() => {
+          if (this.current === 0) {
+            clearInterval(checkDrained);
+            resolve();
+          }
+        }, 100);
+      }
+    });
   }
 }
 
@@ -122,7 +168,7 @@ const contextPool = genericPool.createPool({
 });
 
 // Session cleanup task
-setInterval(() => {
+const sessionCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [sessionId, lastAccess] of sessionLastAccess.entries()) {
     if (now - lastAccess > SESSION_TTL_MS) {
@@ -143,19 +189,130 @@ setInterval(() => {
 const app = express();
 app.use(express.json());
 
-// Request ID middleware
+// Request ID middleware - add X-Request-Id header
 app.use((req, res, next) => {
-  req.id = crypto.randomBytes(8).toString('hex');
+  req.id = req.headers['x-request-id'] || generateRequestId();
   req.startTime = Date.now();
+  res.setHeader('X-Request-Id', req.id);
   next();
 });
 
-// Health check
-app.get('/healthz', (req, res) => {
-  res.json({ ok: true });
+// Ready check middleware
+app.use((req, res, next) => {
+  if (req.path === '/healthz' || req.path === '/version') {
+    return next();
+  }
+  
+  if (isShuttingDown) {
+    return res.status(503).json({
+      code: 'SERVICE_UNAVAILABLE',
+      message: 'Service is shutting down',
+      hint: 'Service is gracefully shutting down, please retry'
+    });
+  }
+  
+  if (!isReady) {
+    return res.status(503).json({
+      code: 'SERVICE_NOT_READY',
+      message: 'Service is starting up',
+      hint: 'Browser pool is still warming up, please wait'
+    });
+  }
+  
+  next();
 });
 
-// Main solve endpoint
+// Version endpoint
+app.get('/version', (req, res) => {
+  const packageJson = require('./package.json');
+  res.json({
+    version: packageJson.version,
+    node: process.version,
+    playwright: packageJson.dependencies.playwright,
+    chromium: chromium._launcher?._browserPath || 'embedded',
+    uptime: process.uptime(),
+    env: process.env.NODE_ENV || 'production',
+    ready: isReady
+  });
+});
+
+// Health check with browser verification
+let healthCheckCache = { ok: false, lastCheck: 0 };
+const HEALTH_CACHE_TTL = 5000; // 5 seconds cache
+
+app.get('/healthz', async (req, res) => {
+  const now = Date.now();
+  
+  // Return cached result if fresh
+  if (healthCheckCache.ok && (now - healthCheckCache.lastCheck) < HEALTH_CACHE_TTL) {
+    return res.json({ 
+      ok: true, 
+      cached: true,
+      ready: isReady,
+      poolSize: contextPool.size,
+      poolAvailable: contextPool.available
+    });
+  }
+  
+  // If not ready, return not ok
+  if (!isReady || !browser) {
+    return res.status(503).json({
+      ok: false,
+      ready: false,
+      message: 'Service not ready'
+    });
+  }
+  
+  // Verify browser is alive
+  let testContext = null;
+  let testPage = null;
+  
+  try {
+    // Quick timeout for health check
+    const healthTimeout = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Health check timeout')), 1000)
+    );
+    
+    const healthTest = async () => {
+      testContext = await contextPool.acquire();
+      testPage = await testContext.newPage();
+      await testPage.close();
+      contextPool.release(testContext);
+      return true;
+    };
+    
+    await Promise.race([healthTest(), healthTimeout]);
+    
+    // Update cache
+    healthCheckCache = { ok: true, lastCheck: now };
+    
+    res.json({ 
+      ok: true,
+      cached: false,
+      ready: isReady,
+      poolSize: contextPool.size,
+      poolAvailable: contextPool.available
+    });
+    
+  } catch (error) {
+    logger.error({ error: error.message }, 'Health check failed');
+    healthCheckCache = { ok: false, lastCheck: now };
+    
+    // Cleanup on failure
+    if (testPage) await testPage.close().catch(() => {});
+    if (testContext) contextPool.release(testContext);
+    
+    res.status(503).json({ 
+      ok: false,
+      ready: isReady,
+      error: error.message,
+      poolSize: contextPool.size,
+      poolAvailable: contextPool.available
+    });
+  }
+});
+
+// Main solve endpoint with timeout
 app.post('/solve', async (req, res) => {
   const { 
     url, 
@@ -166,17 +323,50 @@ app.post('/solve', async (req, res) => {
     blockAssets = true 
   } = req.body;
   
+  // Input validation
   if (!url) {
-    return res.status(400).json({ error: 'url is required' });
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      message: 'Missing required field: url',
+      hint: 'Please provide a valid URL to scrape'
+    });
+  }
+  
+  // URL validation
+  try {
+    new URL(url);
+  } catch (error) {
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      message: 'Invalid URL format',
+      hint: 'Please provide a valid URL with protocol (http:// or https://)'
+    });
   }
 
-  logger.info({ requestId: req.id, url, sessionId, blockAssets }, 'Solving URL');
+  logger.info({ 
+    requestId: req.id, 
+    url, 
+    sessionId, 
+    blockAssets,
+    userAgent: userAgent ? 'custom' : 'default'
+  }, 'Processing request');
   
   let context = null;
   let page = null;
   let fromPool = false;
+  let timeoutHandle = null;
   
-  try {
+  // Set server-level timeout
+  const requestTimeout = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(ErrorTypes.TIMEOUT(
+        'Request timeout exceeded',
+        `Request took longer than ${REQUEST_TIMEOUT_MS}ms. Consider increasing NAV_TIMEOUT_MS or simplifying the request`
+      ));
+    }, REQUEST_TIMEOUT_MS);
+  });
+  
+  const processRequest = async () => {
     await semaphore.acquire();
     
     // Session handling
@@ -269,10 +459,24 @@ app.post('/solve', async (req, res) => {
     }
     
     // Navigate with timeout
-    const response = await page.goto(url, {
-      waitUntil: waitUntil,
-      timeout: NAV_TIMEOUT_MS
-    });
+    let response;
+    try {
+      response = await page.goto(url, {
+        waitUntil: waitUntil,
+        timeout: NAV_TIMEOUT_MS
+      });
+    } catch (error) {
+      if (error.message.includes('timeout')) {
+        throw ErrorTypes.TIMEOUT(
+          `Navigation timeout after ${NAV_TIMEOUT_MS}ms`,
+          'Page took too long to load. Try increasing NAV_TIMEOUT_MS or using waitUntil="domcontentloaded"'
+        );
+      }
+      throw ErrorTypes.PAGE_ERROR(
+        'Failed to navigate to page',
+        error.message
+      );
+    }
     
     // Add human-like behavior
     try {
@@ -301,16 +505,34 @@ app.post('/solve', async (req, res) => {
     await page.waitForTimeout(100);
     
     // Get final URL and HTML
-    const finalUrl = page.url();
-    const html = await page.content();
+    let finalUrl, html;
+    try {
+      finalUrl = page.url();
+      html = await page.content();
+    } catch (error) {
+      throw ErrorTypes.PAGE_ERROR(
+        'Failed to extract page content',
+        'Page may have been closed or navigated away unexpectedly'
+      );
+    }
+    
+    return { finalUrl, html, status: response?.status() || 200 };
+  };
+  
+  try {
+    const result = await Promise.race([processRequest(), requestTimeout]);
+    
+    // Clear timeout
+    if (timeoutHandle) clearTimeout(timeoutHandle);
     
     const duration = Date.now() - req.startTime;
+    
     // Add timing metrics
     const metrics = {
       requestId: req.id,
       url,
-      finalUrl,
-      status: response?.status() || 200,
+      finalUrl: result.finalUrl,
+      status: result.status,
       duration,
       blockAssets,
       waitUntil,
@@ -321,30 +543,61 @@ app.post('/solve', async (req, res) => {
     logger.info(metrics, 'Request completed');
     
     res.json({
-      url: finalUrl,
-      status: response?.status() || 200,
-      html
+      url: result.finalUrl,
+      status: result.status,
+      html: result.html
     });
     
   } catch (error) {
+    // Clear timeout
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    
     const duration = Date.now() - req.startTime;
+    
+    // Determine appropriate status code and response
+    let statusCode = 500;
+    let errorResponse = {
+      code: 'INTERNAL_ERROR',
+      message: error.message
+    };
+    
+    if (error instanceof ServiceError) {
+      errorResponse.code = error.code;
+      errorResponse.message = error.message;
+      if (error.hint) errorResponse.hint = error.hint;
+      
+      switch (error.code) {
+        case 'BAD_REQUEST':
+          statusCode = 400;
+          break;
+        case 'TIMEOUT':
+          statusCode = 408;
+          break;
+        case 'PAGE_ERROR':
+        case 'BROWSER_ERROR':
+          statusCode = 502;
+          break;
+        default:
+          statusCode = 500;
+      }
+    }
+    
     logger.error({ 
       requestId: req.id, 
-      url, 
-      error: error.message, 
+      url,
+      code: errorResponse.code,
+      error: error.message,
+      stack: error.stack,
       duration 
     }, 'Request failed');
     
-    res.status(500).json({
-      error: error.message,
-      type: error.name
-    });
+    res.status(statusCode).json(errorResponse);
     
   } finally {
     // Cleanup
     if (page) {
       await page.close().catch(err => 
-        logger.error({ err }, 'Error closing page')
+        logger.error({ err: err.message }, 'Error closing page')
       );
     }
     
@@ -386,42 +639,104 @@ async function start() {
     }
     
     browser = await chromium.launch(launchOptions);
-    logger.info({ headless: HEADLESS, poolSize: POOL_SIZE }, 'Browser launched');
+    logger.info({ headless: HEADLESS }, 'Browser launched');
     
     // Pre-warm the pool
-    await contextPool.ready();
-    logger.info('Context pool initialized');
+    logger.info({ poolSize: POOL_SIZE }, 'Pre-warming context pool...');
+    const warmupPromises = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+      warmupPromises.push(contextPool.acquire().then(ctx => {
+        contextPool.release(ctx);
+        logger.debug(`Context ${i + 1}/${POOL_SIZE} warmed`);
+      }));
+    }
+    await Promise.all(warmupPromises);
+    logger.info('Context pool pre-warmed and ready');
+    
+    // Mark service as ready
+    isReady = true;
     
     // Start server
-    app.listen(PORT, '0.0.0.0', () => {
-      logger.info({ port: PORT }, 'Server listening');
+    server = app.listen(PORT, '0.0.0.0', () => {
+      logger.info({ port: PORT }, 'Server listening and ready to accept traffic');
     });
     
   } catch (error) {
-    logger.fatal({ error: error.message }, 'Failed to start');
+    logger.fatal({ error: error.message, stack: error.stack }, 'Failed to start');
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down...');
-  
-  // Close all sessions
-  for (const context of sessions.values()) {
-    await context.close().catch(() => {});
+// Graceful shutdown handler
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    logger.info('Shutdown already in progress');
+    return;
   }
   
+  isShuttingDown = true;
+  logger.info({ signal }, 'Graceful shutdown initiated');
+  
+  // Stop accepting new requests
+  isReady = false;
+  
+  // Close server
+  if (server) {
+    logger.info('Closing HTTP server...');
+    await new Promise((resolve) => {
+      server.close(resolve);
+    });
+    logger.info('HTTP server closed');
+  }
+  
+  // Wait for ongoing requests to complete
+  logger.info('Waiting for ongoing requests to complete...');
+  await semaphore.drain();
+  logger.info('All requests completed');
+  
+  // Clear session cleanup interval
+  clearInterval(sessionCleanupInterval);
+  
+  // Close all sessions
+  logger.info('Closing active sessions...');
+  for (const [sessionId, context] of sessions.entries()) {
+    await context.close().catch(err => 
+      logger.error({ err: err.message, sessionId }, 'Error closing session')
+    );
+  }
+  sessions.clear();
+  sessionLastAccess.clear();
+  
   // Drain and close pool
+  logger.info('Draining context pool...');
   await contextPool.drain();
   await contextPool.clear();
+  logger.info('Context pool closed');
   
   // Close browser
   if (browser) {
+    logger.info('Closing browser...');
     await browser.close();
+    logger.info('Browser closed');
   }
   
+  logger.info('Graceful shutdown complete');
   process.exit(0);
+}
+
+// Signal handlers
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Uncaught error handlers
+process.on('uncaughtException', (error) => {
+  logger.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception');
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.fatal({ reason, promise }, 'Unhandled rejection');
+  gracefulShutdown('UNHANDLED_REJECTION');
 });
 
 // Start the service
