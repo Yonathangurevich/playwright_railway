@@ -305,13 +305,20 @@ app.post('/solve', async (req, res) => {
     const html = await page.content();
     
     const duration = Date.now() - req.startTime;
-    logger.info({ 
-      requestId: req.id, 
-      url, 
-      finalUrl, 
-      status: response?.status(), 
-      duration 
-    }, 'Request completed');
+    // Add timing metrics
+    const metrics = {
+      requestId: req.id,
+      url,
+      finalUrl,
+      status: response?.status() || 200,
+      duration,
+      blockAssets,
+      waitUntil,
+      sessionId: sessionId || null,
+      poolAvailable: contextPool.available
+    };
+    
+    logger.info(metrics, 'Request completed');
     
     res.json({
       url: finalUrl,
