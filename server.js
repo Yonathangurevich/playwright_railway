@@ -128,8 +128,8 @@ const needsCfHardening = (url, challengeMode) => {
 // Helper: Check for cf_clearance cookie
 async function hasCfClearance(context, hostname) {
   try {
-    const cookies = await context.cookies(`https://${hostname}`);
-    return cookies.some(c => c.name === 'cf_clearance');
+    const cs = await context.cookies(`https://${hostname}`);
+    return cs.some(c => c.name === 'cf_clearance');
   } catch {
     return false;
   }
@@ -171,27 +171,6 @@ async function runHumanization(page, logger, requestId) {
     });
   } catch (err) {
     logger.debug({ requestId, err: err.message }, 'Scroll action failed (non-critical)');
-  }
-}
-
-// Helper: Check if content is ready
-async function isContentReady(page, selector) {
-  try {
-    if (selector) {
-      const elementExists = await page.evaluate((sel) => {
-        return document.querySelector(sel) !== null;
-      }, selector);
-      return elementExists;
-    } else {
-      // Heuristic: check for sufficient content
-      const hasContent = await page.evaluate(() => {
-        const elements = document.querySelectorAll('a,div,section,table,ul,li');
-        return elements.length > 50;
-      });
-      return hasContent;
-    }
-  } catch {
-    return false;
   }
 }
 
@@ -345,7 +324,7 @@ const sessionCleanupInterval = setInterval(async () => {
 
 // Express app
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // Increase limit for screenshot responses
 
 // Request ID middleware
 app.use((req, res, next) => {
@@ -505,8 +484,10 @@ app.post('/solve', async (req, res) => {
     blockAssets = true,
     challengeMode = false,
     contentReadySelector = null,
+    minHtmlLength = 40000,
     postNavigateWaitMs = null,
-    maxChallengeRounds = 5
+    maxChallengeRounds = 5,
+    returnScreenshot = false
   } = req.body;
   
   // Input validation
@@ -537,6 +518,7 @@ app.post('/solve', async (req, res) => {
   const effectiveBlockAssets = cfHardening ? false : blockAssets;
   const effectiveWaitUntil = cfHardening ? (waitUntil || 'domcontentloaded') : (waitUntil || 'domcontentloaded');
   const effectiveUserAgent = userAgent || DEFAULT_USER_AGENT;
+  const effectivePostNavigateWait = postNavigateWaitMs !== null ? postNavigateWaitMs : (800 + Math.floor(Math.random() * 600));
 
   logger.info({ 
     requestId: req.id, 
@@ -548,7 +530,9 @@ app.post('/solve', async (req, res) => {
     challengeMode,
     cfHardening,
     contentReadySelector,
+    minHtmlLength,
     maxChallengeRounds,
+    returnScreenshot,
     usingProxy: !!(envProxy && envProxy.server),
     userAgent: userAgent ? 'custom' : 'default'
   }, 'Processing request');
@@ -726,104 +710,86 @@ app.post('/solve', async (req, res) => {
       );
     }
     
+    // Post-navigation wait
+    await page.waitForTimeout(effectivePostNavigateWait);
+    
     // Initial humanization
     await runHumanization(page, logger, req.id);
     
     // CF-specific logic
     let gotCfClearance = false;
     let roundsTried = 0;
-    let challenged = false;
+    let challenged = await pageChallenged(page);
     
-    if (cfHardening) {
-      // Check if we already have cf_clearance
-      gotCfClearance = await hasCfClearance(context, hostname);
-      
-      if (!gotCfClearance) {
-        // Check if challenged
-        challenged = await pageChallenged(page);
-        
-        if (challenged) {
-          logger.info({ 
-            requestId: req.id,
-            hostname,
-            challenged: true
-          }, 'CF challenge detected');
-          
-          // Challenge resolution loop
-          for (roundsTried = 1; roundsTried <= maxChallengeRounds; roundsTried++) {
-            logger.debug({ 
-              requestId: req.id,
-              round: roundsTried,
-              maxRounds: maxChallengeRounds
-            }, 'Attempting CF challenge resolution');
-            
-            await page.waitForTimeout(3500);
-            
-            try {
-              await page.waitForNavigation({ 
-                waitUntil: 'domcontentloaded', 
-                timeout: 15000 
-              });
-            } catch {}
-            
-            await runHumanization(page, logger, req.id);
-            
-            gotCfClearance = await hasCfClearance(context, hostname);
-            if (gotCfClearance) {
-              logger.info({ 
-                requestId: req.id,
-                hostname,
-                roundsTried,
-                gotCfClearance: true
-              }, 'CF clearance obtained');
-              break;
-            }
-            
-            challenged = await pageChallenged(page);
-            if (!challenged) {
-              logger.info({ 
-                requestId: req.id,
-                hostname,
-                roundsTried
-              }, 'CF challenge no longer detected');
-              break;
-            }
-          }
-          
-          // Try hard reload if still no clearance
-          if (!gotCfClearance && challenged) {
-            logger.debug({ requestId: req.id }, 'Attempting hard reload');
-            try {
-              await page.reload({ waitUntil: 'domcontentloaded' });
-              await page.waitForTimeout(1000);
-              gotCfClearance = await hasCfClearance(context, hostname);
-              challenged = await pageChallenged(page);
-            } catch {}
-          }
-          
-          // Final check
-          if (!gotCfClearance && challenged) {
-            throw ErrorTypes.CF_CHALLENGE(
-              'Cloudflare challenge could not be bypassed',
-              'Use Chrome channel/residential proxy or reuse sessionId'
-            );
-          }
-        }
-      }
-      
+    if (challenged && cfHardening) {
       logger.info({ 
         requestId: req.id,
         hostname,
-        challenged,
-        roundsTried,
-        gotCfClearance
-      }, 'CF handling completed');
+        challenged: true
+      }, 'CF challenge detected');
+      
+      // Challenge resolution loop
+      for (roundsTried = 1; roundsTried <= maxChallengeRounds; roundsTried++) {
+        logger.debug({ 
+          requestId: req.id,
+          round: roundsTried,
+          maxRounds: maxChallengeRounds
+        }, 'Attempting CF challenge resolution');
+        
+        await page.waitForTimeout(3500);
+        
+        try {
+          await page.waitForNavigation({ 
+            waitUntil: 'domcontentloaded', 
+            timeout: 15000 
+          });
+        } catch {}
+        
+        await runHumanization(page, logger, req.id);
+        
+        // Check for cf_clearance cookie
+        gotCfClearance = await hasCfClearance(context, hostname);
+        if (gotCfClearance) {
+          logger.info({ 
+            requestId: req.id,
+            hostname,
+            roundsTried,
+            gotCfClearance: true
+          }, 'CF clearance obtained');
+          break;
+        }
+        
+        challenged = await pageChallenged(page);
+        if (!challenged) {
+          logger.info({ 
+            requestId: req.id,
+            hostname,
+            roundsTried
+          }, 'CF challenge no longer detected');
+          break;
+        }
+      }
+      
+      // Try hard reload if still challenged
+      if (!gotCfClearance && challenged) {
+        logger.debug({ requestId: req.id }, 'Attempting hard reload');
+        try {
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await page.waitForTimeout(1000);
+          await runHumanization(page, logger, req.id);
+          gotCfClearance = await hasCfClearance(context, hostname);
+          challenged = await pageChallenged(page);
+        } catch {}
+      }
+    } else {
+      // Check if we already have cf_clearance even without challenge
+      gotCfClearance = await hasCfClearance(context, hostname);
     }
     
     // Content readiness check
     if (contentReadySelector) {
       try {
-        await page.waitForSelector(contentReadySelector, { timeout: 8000 });
+        await page.waitForSelector(contentReadySelector, { timeout: 10000 });
         logger.debug({ 
           requestId: req.id,
           selector: contentReadySelector
@@ -832,7 +798,48 @@ app.post('/solve', async (req, res) => {
         logger.debug({ 
           requestId: req.id,
           selector: contentReadySelector
-        }, 'Content selector not found');
+        }, 'Content selector not found within timeout');
+      }
+    }
+    
+    // Get HTML content
+    const html = await page.content();
+    
+    // Final readiness decision
+    const htmlLength = html.length;
+    const stillChallenged = await pageChallenged(page);
+    
+    if (htmlLength < minHtmlLength && stillChallenged) {
+      logger.warn({ 
+        requestId: req.id,
+        hostname,
+        htmlLength,
+        minHtmlLength,
+        stillChallenged
+      }, 'Content too short and still challenged');
+      
+      throw ErrorTypes.CF_CHALLENGE(
+        'Cloudflare challenge could not be bypassed',
+        `HTML too short (${htmlLength} < ${minHtmlLength}) and still challenged. Try session reuse or residential proxy`
+      );
+    }
+    
+    // Get screenshot if requested
+    let screenshot = undefined;
+    if (returnScreenshot) {
+      try {
+        const screenshotBuffer = await page.screenshot({ 
+          type: 'jpeg', 
+          quality: 60, 
+          fullPage: true 
+        });
+        screenshot = screenshotBuffer.toString('base64');
+        logger.debug({ requestId: req.id }, 'Screenshot captured');
+      } catch (err) {
+        logger.error({ 
+          requestId: req.id,
+          error: err.message 
+        }, 'Failed to capture screenshot');
       }
     }
     
@@ -849,17 +856,29 @@ app.post('/solve', async (req, res) => {
       sameSite: c.sameSite
     }));
     
-    // Get final content
+    // Get final cf_clearance status
+    const finalCfClearance = await hasCfClearance(context, hostname);
+    
+    logger.info({ 
+      requestId: req.id,
+      hostname,
+      challenged: stillChallenged,
+      roundsTried,
+      gotCfClearance: finalCfClearance,
+      htmlLength
+    }, 'Request processing completed');
+    
+    // Get final URL
     const finalUrl = page.url();
-    const html = await page.content();
     
     return { 
-      finalUrl, 
-      html, 
       status: 200,
-      gotCfClearance,
+      url: finalUrl,
+      html,
+      usingProxy: !!(envProxy && envProxy.server),
+      gotCfClearance: finalCfClearance,
       cookies: maskedCookies,
-      usingProxy: !!(envProxy && envProxy.server)
+      screenshot
     };
   };
   
@@ -873,21 +892,15 @@ app.post('/solve', async (req, res) => {
     logger.info({
       requestId: req.id,
       url,
-      finalUrl: result.finalUrl,
+      finalUrl: result.url,
       status: result.status,
       duration,
       gotCfClearance: result.gotCfClearance,
-      usingProxy: result.usingProxy
+      usingProxy: result.usingProxy,
+      htmlLength: result.html.length
     }, 'Request completed successfully');
     
-    res.json({
-      status: result.status,
-      url: result.finalUrl,
-      html: result.html,
-      gotCfClearance: result.gotCfClearance,
-      cookies: result.cookies,
-      usingProxy: result.usingProxy
-    });
+    res.json(result);
     
   } catch (error) {
     if (timeoutHandle) clearTimeout(timeoutHandle);
