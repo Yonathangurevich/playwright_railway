@@ -82,6 +82,12 @@ const generateRequestId = () => {
   });
 };
 
+// Utility: Mask cookie value
+const maskCookieValue = (value) => {
+  if (!value || value.length <= 6) return '***';
+  return value.slice(0, 3) + '***' + value.slice(-3);
+};
+
 // Check if URL needs Cloudflare hardening
 const needsCfHardening = (url, challengeMode) => {
   if (challengeMode) return true;
@@ -103,105 +109,14 @@ async function hasCfClearance(context, hostname) {
   }
 }
 
-// Helper: Check if page has Cloudflare challenge
-async function isChallenged(page) {
+// Helper: Check if page is challenged
+async function pageChallenged(page) {
   try {
-    const title = await page.title().catch(() => '');
-    if (/just a moment|checking your browser/i.test(title)) {
-      return true;
-    }
-    
-    const bodyText = await page.evaluate(() => 
+    const t = await page.title().catch(() => '');
+    const b = await page.evaluate(() => 
       document.body ? document.body.innerText.slice(0, 2000) : ''
     ).catch(() => '');
-    
-    return /cf-browser-verification|cloudflare/i.test(bodyText);
-  } catch {
-    return false;
-  }
-}
-
-// Helper: Wait for CF challenge to pass
-async function awaitCfPass(page, context, hostname, rounds = 3, logger, requestId) {
-  for (let i = 0; i < rounds; i++) {
-    logger.info({ 
-      requestId,
-      hostname,
-      round: i + 1,
-      maxRounds: rounds
-    }, 'Waiting for CF challenge resolution');
-    
-    // Wait for CF processing
-    await page.waitForTimeout(3500);
-    
-    // Try to wait for navigation
-    try {
-      await page.waitForNavigation({ 
-        waitUntil: 'domcontentloaded', 
-        timeout: 15000 
-      });
-    } catch (navErr) {
-      logger.debug({ 
-        requestId,
-        round: i + 1,
-        err: navErr.message
-      }, 'Navigation wait timeout (may be normal)');
-    }
-    
-    // Small humanization
-    try {
-      await page.mouse.move(200 + Math.random() * 100, 200 + Math.random() * 100, { steps: 4 });
-      await page.evaluate(() => { window.scrollBy(0, 120); });
-    } catch {}
-    
-    // Check if we got cf_clearance cookie
-    if (await hasCfClearance(context, hostname)) {
-      logger.info({ 
-        requestId,
-        hostname,
-        round: i + 1,
-        gotCfClearance: true
-      }, 'CF clearance cookie detected');
-      return true;
-    }
-    
-    // Check if no longer challenged
-    if (!(await isChallenged(page))) {
-      logger.info({ 
-        requestId,
-        hostname,
-        round: i + 1,
-        challenged: false
-      }, 'CF challenge cleared (no longer detected)');
-      return true;
-    }
-  }
-  
-  return false;
-}
-
-// Helper: Check if content is ready
-async function isContentReady(page, selector) {
-  try {
-    if (selector) {
-      // Use provided selector
-      const elementExists = await page.evaluate((sel) => {
-        return document.querySelector(sel) !== null;
-      }, selector);
-      return elementExists;
-    } else {
-      // Heuristic: check for sufficient content AND not challenged
-      const hasContent = await page.evaluate(() => {
-        const elements = document.querySelectorAll('a,div,section,table,ul,li');
-        return elements.length > 50;
-      });
-      
-      if (!hasContent) return false;
-      
-      // Also verify not challenged
-      const challenged = await isChallenged(page);
-      return !challenged;
-    }
+    return /just a moment|checking your browser|cloudflare|cf-browser-verification/i.test(t + ' ' + b);
   } catch {
     return false;
   }
@@ -210,17 +125,47 @@ async function isContentReady(page, selector) {
 // Helper: Run humanization actions
 async function runHumanization(page, logger, requestId) {
   try {
-    await page.mouse.move(200, 200, { steps: 4 });
+    // Random wait 800-1400ms
+    await randomDelay(800, 1400);
+    
+    // Small mouse movement
+    await page.mouse.move(
+      200 + Math.floor(Math.random() * 100), 
+      200 + Math.floor(Math.random() * 100), 
+      { steps: 4 }
+    );
   } catch (err) {
     logger.debug({ requestId, err: err.message }, 'Mouse move failed (non-critical)');
   }
   
   try {
+    // Tiny scroll
     await page.evaluate(() => {
-      window.scrollBy(0, 120);
+      window.scrollBy(0, 50 + Math.floor(Math.random() * 70));
     });
   } catch (err) {
     logger.debug({ requestId, err: err.message }, 'Scroll action failed (non-critical)');
+  }
+}
+
+// Helper: Check if content is ready
+async function isContentReady(page, selector) {
+  try {
+    if (selector) {
+      const elementExists = await page.evaluate((sel) => {
+        return document.querySelector(sel) !== null;
+      }, selector);
+      return elementExists;
+    } else {
+      // Heuristic: check for sufficient content
+      const hasContent = await page.evaluate(() => {
+        const elements = document.querySelectorAll('a,div,section,table,ul,li');
+        return elements.length > 50;
+      });
+      return hasContent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -312,10 +257,6 @@ const contextPool = genericPool.createPool({
       }
     };
     
-    if (PROXY) {
-      contextOptions.proxy = { server: PROXY };
-    }
-    
     return await browser.newContext(contextOptions);
   },
   destroy: async (context) => {
@@ -323,7 +264,6 @@ const contextPool = genericPool.createPool({
     await context.close();
   },
   validate: async (context) => {
-    // Basic validation - check if context is still usable
     try {
       await context.pages();
       return true;
@@ -375,13 +315,13 @@ const sessionCleanupInterval = setInterval(async () => {
       remaining: sessions.size 
     }, 'Session cleanup completed');
   }
-}, 60000); // Run every minute
+}, 60000);
 
 // Express app
 const app = express();
 app.use(express.json());
 
-// Request ID middleware - add X-Request-Id header
+// Request ID middleware
 app.use((req, res, next) => {
   req.id = req.headers['x-request-id'] || generateRequestId();
   req.startTime = Date.now();
@@ -423,6 +363,7 @@ app.get('/version', (req, res) => {
     playwright: packageJson.dependencies.playwright,
     chromium: chromium._launcher?._browserPath || 'embedded',
     chromeChannel: USE_CHROME_CHANNEL,
+    usingProxy: !!PROXY,
     uptime: process.uptime(),
     env: process.env.NODE_ENV || 'production',
     ready: isReady
@@ -436,7 +377,7 @@ app.get('/sessions', (req, res) => {
   
   for (const [sessionId, session] of sessions.entries()) {
     sessionInfo.push({
-      sessionId: sessionId.substring(0, 8) + '...', // Mask sensitive data
+      sessionId: sessionId.substring(0, 8) + '...',
       createdAt: new Date(session.createdAt).toISOString(),
       lastUsedAt: new Date(session.lastUsedAt).toISOString(),
       ageSeconds: Math.round((now - session.createdAt) / 1000),
@@ -445,7 +386,6 @@ app.get('/sessions', (req, res) => {
     });
   }
   
-  // Sort by last used (most recent first)
   sessionInfo.sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
   
   res.json({
@@ -460,12 +400,11 @@ app.get('/sessions', (req, res) => {
 
 // Health check with browser verification
 let healthCheckCache = { ok: false, lastCheck: 0 };
-const HEALTH_CACHE_TTL = 5000; // 5 seconds cache
+const HEALTH_CACHE_TTL = 5000;
 
 app.get('/healthz', async (req, res) => {
   const now = Date.now();
   
-  // Return cached result if fresh
   if (healthCheckCache.ok && (now - healthCheckCache.lastCheck) < HEALTH_CACHE_TTL) {
     return res.json({ 
       ok: true, 
@@ -476,7 +415,6 @@ app.get('/healthz', async (req, res) => {
     });
   }
   
-  // If not ready, return not ok
   if (!isReady || !browser) {
     return res.status(503).json({
       ok: false,
@@ -485,12 +423,10 @@ app.get('/healthz', async (req, res) => {
     });
   }
   
-  // Verify browser is alive
   let testContext = null;
   let testPage = null;
   
   try {
-    // Quick timeout for health check
     const healthTimeout = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Health check timeout')), 1000)
     );
@@ -505,7 +441,6 @@ app.get('/healthz', async (req, res) => {
     
     await Promise.race([healthTest(), healthTimeout]);
     
-    // Update cache
     healthCheckCache = { ok: true, lastCheck: now };
     
     res.json({ 
@@ -520,7 +455,6 @@ app.get('/healthz', async (req, res) => {
     logger.error({ error: error.message }, 'Health check failed');
     healthCheckCache = { ok: false, lastCheck: now };
     
-    // Cleanup on failure
     if (testPage) await testPage.close().catch(() => {});
     if (testContext) contextPool.release(testContext);
     
@@ -534,7 +468,7 @@ app.get('/healthz', async (req, res) => {
   }
 });
 
-// Main solve endpoint with timeout and CF protection
+// Main solve endpoint
 app.post('/solve', async (req, res) => {
   const { 
     url, 
@@ -546,7 +480,7 @@ app.post('/solve', async (req, res) => {
     challengeMode = false,
     contentReadySelector = null,
     postNavigateWaitMs = null,
-    maxChallengeRounds = 4
+    maxChallengeRounds = 5
   } = req.body;
   
   // Input validation
@@ -558,7 +492,6 @@ app.post('/solve', async (req, res) => {
     });
   }
   
-  // URL validation
   let hostname;
   try {
     const urlObj = new URL(url);
@@ -578,7 +511,6 @@ app.post('/solve', async (req, res) => {
   const effectiveBlockAssets = cfHardening ? false : blockAssets;
   const effectiveWaitUntil = cfHardening ? (waitUntil || 'domcontentloaded') : (waitUntil || 'domcontentloaded');
   const effectiveUserAgent = userAgent || DEFAULT_USER_AGENT;
-  const effectivePostNavigateWait = postNavigateWaitMs !== null ? postNavigateWaitMs : (600 + Math.floor(Math.random() * 800));
 
   logger.info({ 
     requestId: req.id, 
@@ -590,8 +522,8 @@ app.post('/solve', async (req, res) => {
     challengeMode,
     cfHardening,
     contentReadySelector,
-    postNavigateWaitMs: effectivePostNavigateWait,
     maxChallengeRounds,
+    usingProxy: !!PROXY,
     userAgent: userAgent ? 'custom' : 'default'
   }, 'Processing request');
   
@@ -613,12 +545,11 @@ app.post('/solve', async (req, res) => {
   const processRequest = async () => {
     await semaphore.acquire();
     
-    // Session handling with proper pooling
+    // Session handling
     if (sessionId) {
       const existingSession = sessions.get(sessionId);
       
       if (existingSession) {
-        // Update last used time (extend TTL)
         existingSession.lastUsedAt = Date.now();
         context = existingSession.context;
         logger.debug({ 
@@ -626,12 +557,10 @@ app.post('/solve', async (req, res) => {
           age: Math.round((Date.now() - existingSession.createdAt) / 1000) + 's'
         }, 'Reusing existing session');
       } else {
-        // Check if we're at max sessions
         if (sessions.size >= SESSION_MAX) {
           await evictLRUSession();
         }
         
-        // Create new session context with CF-optimized settings
         const contextOptions = {
           userAgent: effectiveUserAgent,
           locale: cfHardening ? 'en-US' : 'en-US',
@@ -644,11 +573,9 @@ app.post('/solve', async (req, res) => {
             'Accept-Language': 'en-US,en;q=0.9'
           }
         };
-        if (PROXY) contextOptions.proxy = { server: PROXY };
         
         context = await browser.newContext(contextOptions);
         
-        // Store session with metadata
         const now = Date.now();
         sessions.set(sessionId, {
           context,
@@ -662,10 +589,8 @@ app.post('/solve', async (req, res) => {
         }, 'Created new session');
       }
       
-      // Sessions are never returned to the generic pool
       fromPool = false;
     } else {
-      // Use pooled context for non-session requests
       context = await contextPool.acquire();
       fromPool = true;
     }
@@ -673,16 +598,15 @@ app.post('/solve', async (req, res) => {
     // Create page
     page = await context.newPage();
     
-    // Set custom user agent if provided and not using session
+    // Set custom user agent if provided
     if (userAgent && !sessionId) {
       await page.setExtraHTTPHeaders({ 
         'User-Agent': userAgent
       });
     }
     
-    // Set realistic headers based on CF hardening
+    // Set headers based on CF hardening
     if (cfHardening) {
-      // Apply CF-specific headers
       await page.setExtraHTTPHeaders({
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -699,7 +623,6 @@ app.post('/solve', async (req, res) => {
         'Upgrade-Insecure-Requests': '1'
       });
     } else {
-      // Standard headers
       await page.setExtraHTTPHeaders({
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -730,7 +653,7 @@ app.post('/solve', async (req, res) => {
       await context.addCookies(formattedCookies);
     }
     
-    // Enhanced asset blocking (disabled for CF sites)
+    // Asset blocking
     if (effectiveBlockAssets) {
       await page.route('**/*', (route) => {
         const resourceType = route.request().resourceType();
@@ -745,7 +668,7 @@ app.post('/solve', async (req, res) => {
       logger.debug({ requestId: req.id }, 'Asset blocking enabled');
     }
     
-    // Navigate with timeout
+    // Navigate
     let response;
     try {
       response = await page.goto(url, {
@@ -765,144 +688,174 @@ app.post('/solve', async (req, res) => {
       );
     }
     
-    // Post-navigation wait with jitter
-    await page.waitForTimeout(effectivePostNavigateWait);
-    logger.debug({ 
-      requestId: req.id, 
-      waitMs: effectivePostNavigateWait 
-    }, 'Post-navigation wait completed');
-    
     // Initial humanization
     await runHumanization(page, logger, req.id);
     
     // CF-specific logic
     let gotCfClearance = false;
-    let challengeRounds = 0;
+    let roundsTried = 0;
+    let challenged = false;
     
     if (cfHardening) {
       // Check if we already have cf_clearance
       gotCfClearance = await hasCfClearance(context, hostname);
       
-      if (gotCfClearance) {
-        logger.info({ 
-          requestId: req.id,
-          hostname,
-          gotCfClearance: true
-        }, 'CF clearance already present');
-      } else {
+      if (!gotCfClearance) {
         // Check if challenged
-        const challenged = await isChallenged(page);
+        challenged = await pageChallenged(page);
         
         if (challenged) {
           logger.info({ 
             requestId: req.id,
             hostname,
             challenged: true
-          }, 'CF challenge detected, attempting resolution');
+          }, 'CF challenge detected');
           
-          // Try to resolve challenge
-          const passed = await awaitCfPass(page, context, hostname, maxChallengeRounds, logger, req.id);
-          challengeRounds = maxChallengeRounds;
-          gotCfClearance = passed;
+          // Challenge resolution loop
+          for (roundsTried = 1; roundsTried <= maxChallengeRounds; roundsTried++) {
+            logger.debug({ 
+              requestId: req.id,
+              round: roundsTried,
+              maxRounds: maxChallengeRounds
+            }, 'Attempting CF challenge resolution');
+            
+            await page.waitForTimeout(3500);
+            
+            try {
+              await page.waitForNavigation({ 
+                waitUntil: 'domcontentloaded', 
+                timeout: 15000 
+              });
+            } catch {}
+            
+            await runHumanization(page, logger, req.id);
+            
+            gotCfClearance = await hasCfClearance(context, hostname);
+            if (gotCfClearance) {
+              logger.info({ 
+                requestId: req.id,
+                hostname,
+                roundsTried,
+                gotCfClearance: true
+              }, 'CF clearance obtained');
+              break;
+            }
+            
+            challenged = await pageChallenged(page);
+            if (!challenged) {
+              logger.info({ 
+                requestId: req.id,
+                hostname,
+                roundsTried
+              }, 'CF challenge no longer detected');
+              break;
+            }
+          }
           
-          if (!passed) {
+          // Try hard reload if still no clearance
+          if (!gotCfClearance && challenged) {
+            logger.debug({ requestId: req.id }, 'Attempting hard reload');
+            try {
+              await page.reload({ waitUntil: 'domcontentloaded' });
+              await page.waitForTimeout(1000);
+              gotCfClearance = await hasCfClearance(context, hostname);
+              challenged = await pageChallenged(page);
+            } catch {}
+          }
+          
+          // Final check
+          if (!gotCfClearance && challenged) {
             throw ErrorTypes.CF_CHALLENGE(
               'Cloudflare challenge could not be bypassed',
-              'Still challenged. Try session reuse or proxy.'
+              'Use Chrome channel/residential proxy or reuse sessionId'
             );
           }
         }
       }
+      
+      logger.info({ 
+        requestId: req.id,
+        hostname,
+        challenged,
+        roundsTried,
+        gotCfClearance
+      }, 'CF handling completed');
     }
     
     // Content readiness check
-    let contentReady = false;
-    
     if (contentReadySelector) {
-      // Wait for selector with bounded timeout
       try {
-        await page.waitForSelector(contentReadySelector, { timeout: 10000 });
-        contentReady = true;
+        await page.waitForSelector(contentReadySelector, { timeout: 8000 });
         logger.debug({ 
           requestId: req.id,
           selector: contentReadySelector
         }, 'Content selector found');
       } catch {
-        contentReady = false;
         logger.debug({ 
           requestId: req.id,
           selector: contentReadySelector
-        }, 'Content selector not found within timeout');
+        }, 'Content selector not found');
       }
-    } else {
-      // Use heuristic
-      contentReady = await isContentReady(page, null);
     }
     
-    logger.info({ 
-      requestId: req.id,
-      hostname,
-      challenged: false,
-      gotCfClearance,
-      contentReady,
-      selectorUsed: !!contentReadySelector,
-      rounds: challengeRounds
-    }, 'Request processing completed');
+    // Get cookies for response
+    const responseCookies = await context.cookies(`https://${hostname}`);
+    const maskedCookies = responseCookies.map(c => ({
+      name: c.name,
+      value: maskCookieValue(c.value),
+      domain: c.domain,
+      path: c.path,
+      expires: c.expires,
+      httpOnly: c.httpOnly,
+      secure: c.secure,
+      sameSite: c.sameSite
+    }));
     
     // Get final content
-    if (contentReady || gotCfClearance) {
-      const finalUrl = page.url();
-      const html = await page.content();
-      return { finalUrl, html, status: 200 };
-    } else {
-      throw ErrorTypes.CONTENT_NOT_READY(
-        'Content not ready',
-        'Adjust contentReadySelector or disable blockAssets'
-      );
-    }
+    const finalUrl = page.url();
+    const html = await page.content();
+    
+    return { 
+      finalUrl, 
+      html, 
+      status: 200,
+      gotCfClearance,
+      cookies: maskedCookies,
+      usingProxy: !!PROXY
+    };
   };
   
   try {
     const result = await Promise.race([processRequest(), requestTimeout]);
     
-    // Clear timeout
     if (timeoutHandle) clearTimeout(timeoutHandle);
     
     const duration = Date.now() - req.startTime;
     
-    // Add timing metrics
-    const metrics = {
+    logger.info({
       requestId: req.id,
       url,
       finalUrl: result.finalUrl,
       status: result.status,
       duration,
-      blockAssets: effectiveBlockAssets,
-      waitUntil: effectiveWaitUntil,
-      sessionId: sessionId || null,
-      sessionsActive: sessions.size,
-      poolAvailable: contextPool.available,
-      cfHardening,
-      challengeMode,
-      contentReadySelector: !!contentReadySelector,
-      postNavigateWaitMs: effectivePostNavigateWait
-    };
-    
-    logger.info(metrics, 'Request completed successfully');
+      gotCfClearance: result.gotCfClearance,
+      usingProxy: result.usingProxy
+    }, 'Request completed successfully');
     
     res.json({
       status: result.status,
       url: result.finalUrl,
-      html: result.html
+      html: result.html,
+      gotCfClearance: result.gotCfClearance,
+      cookies: result.cookies,
+      usingProxy: result.usingProxy
     });
     
   } catch (error) {
-    // Clear timeout
     if (timeoutHandle) clearTimeout(timeoutHandle);
     
     const duration = Date.now() - req.startTime;
     
-    // Determine appropriate status code and response
     let statusCode = 500;
     let errorResponse = {
       code: 'INTERNAL_ERROR',
@@ -943,25 +896,23 @@ app.post('/solve', async (req, res) => {
       stack: error.stack,
       duration,
       cfHardening,
-      challengeMode
+      challengeMode,
+      usingProxy: !!PROXY
     }, 'Request failed');
     
     errorResponse.status = statusCode;
     res.status(statusCode).json(errorResponse);
     
   } finally {
-    // Cleanup
     if (page) {
       await page.close().catch(err => 
         logger.error({ err: err.message }, 'Error closing page')
       );
     }
     
-    // Only release context back to pool if it's not a session
     if (fromPool && context) {
       contextPool.release(context);
     }
-    // Session contexts are NOT returned to pool - they remain reserved
     
     semaphore.release();
   }
@@ -971,47 +922,54 @@ app.post('/solve', async (req, res) => {
 async function start() {
   try {
     logger.info({ 
-      chromeChannel: USE_CHROME_CHANNEL 
+      chromeChannel: USE_CHROME_CHANNEL,
+      proxyEnabled: !!PROXY
     }, 'Starting scraper service...');
+    
+    if (PROXY) {
+      logger.info(`Proxy enabled: ${PROXY}`);
+    }
+    
+    // Build launch args
+    const launchArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+      '--hide-scrollbars',
+      '--mute-audio',
+      '--disable-web-security',
+      '--disable-infobars',
+      '--window-size=1920,1080',
+      '--start-maximized'
+    ];
+    
+    // Add proxy server if configured
+    if (PROXY) {
+      launchArgs.push(`--proxy-server=${PROXY}`);
+    }
     
     // Launch browser with stealth-optimized args
     const launchOptions = {
       headless: HEADLESS,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-blink-features=AutomationControlled',
-        '--hide-scrollbars',
-        '--mute-audio',
-        '--disable-web-security',
-        '--disable-infobars',
-        '--window-size=1920,1080',
-        '--start-maximized'
-      ]
+      args: launchArgs
     };
     
-    // Add channel if using Chrome stable
+    // Use Chrome channel if configured
     if (USE_CHROME_CHANNEL) {
       launchOptions.channel = 'chrome';
       logger.info('Using Chrome stable channel');
-    } else {
-      // Add more aggressive args for Chromium
-      launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
-    }
-    
-    if (PROXY) {
-      launchOptions.proxy = { server: PROXY };
     }
     
     browser = await chromium.launch(launchOptions);
     logger.info({ 
       headless: HEADLESS,
-      channel: USE_CHROME_CHANNEL ? 'chrome' : 'chromium'
+      channel: USE_CHROME_CHANNEL ? 'chrome' : 'chromium',
+      proxyEnabled: !!PROXY
     }, 'Browser launched');
     
     // Pre-warm the pool
@@ -1026,12 +984,13 @@ async function start() {
     await Promise.all(warmupPromises);
     logger.info('Context pool pre-warmed and ready');
     
-    // Mark service as ready
     isReady = true;
     
-    // Start server
     server = app.listen(PORT, '0.0.0.0', () => {
-      logger.info({ port: PORT }, 'Server listening and ready to accept traffic');
+      logger.info({ 
+        port: PORT,
+        proxyEnabled: !!PROXY
+      }, 'Server listening and ready to accept traffic');
     });
     
   } catch (error) {
@@ -1050,10 +1009,8 @@ async function gracefulShutdown(signal) {
   isShuttingDown = true;
   logger.info({ signal }, 'Graceful shutdown initiated');
   
-  // Stop accepting new requests
   isReady = false;
   
-  // Close server
   if (server) {
     logger.info('Closing HTTP server...');
     await new Promise((resolve) => {
@@ -1062,15 +1019,12 @@ async function gracefulShutdown(signal) {
     logger.info('HTTP server closed');
   }
   
-  // Wait for ongoing requests to complete
   logger.info('Waiting for ongoing requests to complete...');
   await semaphore.drain();
   logger.info('All requests completed');
   
-  // Clear session cleanup interval
   clearInterval(sessionCleanupInterval);
   
-  // Close all sessions
   logger.info('Closing active sessions...');
   for (const [sessionId, session] of sessions.entries()) {
     await session.context.close().catch(err => 
@@ -1079,13 +1033,11 @@ async function gracefulShutdown(signal) {
   }
   sessions.clear();
   
-  // Drain and close pool
   logger.info('Draining context pool...');
   await contextPool.drain();
   await contextPool.clear();
   logger.info('Context pool closed');
   
-  // Close browser
   if (browser) {
     logger.info('Closing browser...');
     await browser.close();
