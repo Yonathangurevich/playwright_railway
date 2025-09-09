@@ -21,6 +21,7 @@ const SESSION_MAX = parseInt(process.env.SESSION_MAX || '100');
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || '3');
 const PROXY = process.env.PROXY || null;
 const REQUEST_TIMEOUT_MS = NAV_TIMEOUT_MS + 5000; // Server timeout buffer
+const USE_CHROME_CHANNEL = process.env.USE_CHROME_CHANNEL === 'true';
 
 // Default headers for stealth
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -92,6 +93,16 @@ const needsCfHardening = (url, challengeMode) => {
   }
 };
 
+// Helper: Check for cf_clearance cookie
+async function hasCfClearance(context, hostname) {
+  try {
+    const cookies = await context.cookies(`https://${hostname}`);
+    return cookies.some(c => c.name === 'cf_clearance');
+  } catch {
+    return false;
+  }
+}
+
 // Helper: Check if page has Cloudflare challenge
 async function isChallenged(page) {
   try {
@@ -108,6 +119,65 @@ async function isChallenged(page) {
   } catch {
     return false;
   }
+}
+
+// Helper: Wait for CF challenge to pass
+async function awaitCfPass(page, context, hostname, rounds = 3, logger, requestId) {
+  for (let i = 0; i < rounds; i++) {
+    logger.info({ 
+      requestId,
+      hostname,
+      round: i + 1,
+      maxRounds: rounds
+    }, 'Waiting for CF challenge resolution');
+    
+    // Wait for CF processing
+    await page.waitForTimeout(3500);
+    
+    // Try to wait for navigation
+    try {
+      await page.waitForNavigation({ 
+        waitUntil: 'domcontentloaded', 
+        timeout: 15000 
+      });
+    } catch (navErr) {
+      logger.debug({ 
+        requestId,
+        round: i + 1,
+        err: navErr.message
+      }, 'Navigation wait timeout (may be normal)');
+    }
+    
+    // Small humanization
+    try {
+      await page.mouse.move(200 + Math.random() * 100, 200 + Math.random() * 100, { steps: 4 });
+      await page.evaluate(() => { window.scrollBy(0, 120); });
+    } catch {}
+    
+    // Check if we got cf_clearance cookie
+    if (await hasCfClearance(context, hostname)) {
+      logger.info({ 
+        requestId,
+        hostname,
+        round: i + 1,
+        gotCfClearance: true
+      }, 'CF clearance cookie detected');
+      return true;
+    }
+    
+    // Check if no longer challenged
+    if (!(await isChallenged(page))) {
+      logger.info({ 
+        requestId,
+        hostname,
+        round: i + 1,
+        challenged: false
+      }, 'CF challenge cleared (no longer detected)');
+      return true;
+    }
+  }
+  
+  return false;
 }
 
 // Helper: Check if content is ready
@@ -352,6 +422,7 @@ app.get('/version', (req, res) => {
     node: process.version,
     playwright: packageJson.dependencies.playwright,
     chromium: chromium._launcher?._browserPath || 'embedded',
+    chromeChannel: USE_CHROME_CHANNEL,
     uptime: process.uptime(),
     env: process.env.NODE_ENV || 'production',
     ready: isReady
@@ -475,7 +546,7 @@ app.post('/solve', async (req, res) => {
     challengeMode = false,
     contentReadySelector = null,
     postNavigateWaitMs = null,
-    maxChallengeRounds = 2
+    maxChallengeRounds = 4
   } = req.body;
   
   // Input validation
@@ -704,88 +775,86 @@ app.post('/solve', async (req, res) => {
     // Initial humanization
     await runHumanization(page, logger, req.id);
     
-    // Check for Cloudflare challenge
-    let challenged = await isChallenged(page);
+    // CF-specific logic
+    let gotCfClearance = false;
     let challengeRounds = 0;
     
-    if (challenged) {
-      logger.info({ 
-        requestId: req.id, 
-        hostname,
-        challenged: true
-      }, 'Cloudflare challenge detected');
+    if (cfHardening) {
+      // Check if we already have cf_clearance
+      gotCfClearance = await hasCfClearance(context, hostname);
       
-      // Challenge resolution loop
-      while (challenged && challengeRounds < maxChallengeRounds) {
-        challengeRounds++;
+      if (gotCfClearance) {
         logger.info({ 
           requestId: req.id,
-          round: challengeRounds,
-          maxRounds: maxChallengeRounds
-        }, 'Attempting to resolve CF challenge');
+          hostname,
+          gotCfClearance: true
+        }, 'CF clearance already present');
+      } else {
+        // Check if challenged
+        const challenged = await isChallenged(page);
         
-        // Wait for CF to process
-        await page.waitForTimeout(3500);
-        
-        // Try to wait for navigation
-        try {
-          await page.waitForNavigation({ 
-            waitUntil: 'domcontentloaded', 
-            timeout: 15000 
-          });
-        } catch (navErr) {
-          logger.debug({ 
-            requestId: req.id,
-            round: challengeRounds,
-            err: navErr.message
-          }, 'Navigation wait timeout (may be normal)');
-        }
-        
-        // Run humanization again
-        await runHumanization(page, logger, req.id);
-        
-        // Re-check if still challenged
-        challenged = await isChallenged(page);
-        
-        if (!challenged) {
+        if (challenged) {
           logger.info({ 
             requestId: req.id,
             hostname,
-            roundsAttempted: challengeRounds
-          }, 'Cloudflare challenge cleared');
-          break;
+            challenged: true
+          }, 'CF challenge detected, attempting resolution');
+          
+          // Try to resolve challenge
+          const passed = await awaitCfPass(page, context, hostname, maxChallengeRounds, logger, req.id);
+          challengeRounds = maxChallengeRounds;
+          gotCfClearance = passed;
+          
+          if (!passed) {
+            throw ErrorTypes.CF_CHALLENGE(
+              'Cloudflare challenge could not be bypassed',
+              'Still challenged. Try session reuse or proxy.'
+            );
+          }
         }
       }
     }
     
-    // Final content readiness check
-    const contentReady = await isContentReady(page, contentReadySelector);
-    const stillChallenged = await isChallenged(page);
+    // Content readiness check
+    let contentReady = false;
+    
+    if (contentReadySelector) {
+      // Wait for selector with bounded timeout
+      try {
+        await page.waitForSelector(contentReadySelector, { timeout: 10000 });
+        contentReady = true;
+        logger.debug({ 
+          requestId: req.id,
+          selector: contentReadySelector
+        }, 'Content selector found');
+      } catch {
+        contentReady = false;
+        logger.debug({ 
+          requestId: req.id,
+          selector: contentReadySelector
+        }, 'Content selector not found within timeout');
+      }
+    } else {
+      // Use heuristic
+      contentReady = await isContentReady(page, null);
+    }
     
     logger.info({ 
       requestId: req.id,
       hostname,
-      challenged: stillChallenged,
+      challenged: false,
+      gotCfClearance,
       contentReady,
       selectorUsed: !!contentReadySelector,
-      selectorMatched: contentReadySelector ? contentReady : null,
-      roundsAttempted: challengeRounds
-    }, 'Content readiness check completed');
+      rounds: challengeRounds
+    }, 'Request processing completed');
     
-    // Determine final status
-    if (contentReady) {
-      // Content is ready - success
+    // Get final content
+    if (contentReady || gotCfClearance) {
       const finalUrl = page.url();
       const html = await page.content();
       return { finalUrl, html, status: 200 };
-    } else if (stillChallenged) {
-      // Still challenged after max rounds
-      throw ErrorTypes.CF_CHALLENGE(
-        'Cloudflare challenge could not be bypassed',
-        'Try residential proxy or reuse sessionId / longer NAV_TIMEOUT_MS'
-      );
     } else {
-      // Content not ready but not challenged
       throw ErrorTypes.CONTENT_NOT_READY(
         'Content not ready',
         'Adjust contentReadySelector or disable blockAssets'
@@ -901,7 +970,9 @@ app.post('/solve', async (req, res) => {
 // Startup
 async function start() {
   try {
-    logger.info('Starting scraper service...');
+    logger.info({ 
+      chromeChannel: USE_CHROME_CHANNEL 
+    }, 'Starting scraper service...');
     
     // Launch browser with stealth-optimized args
     const launchOptions = {
@@ -915,7 +986,6 @@ async function start() {
         '--no-zygote',
         '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process',
         '--hide-scrollbars',
         '--mute-audio',
         '--disable-web-security',
@@ -925,12 +995,24 @@ async function start() {
       ]
     };
     
+    // Add channel if using Chrome stable
+    if (USE_CHROME_CHANNEL) {
+      launchOptions.channel = 'chrome';
+      logger.info('Using Chrome stable channel');
+    } else {
+      // Add more aggressive args for Chromium
+      launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
+    }
+    
     if (PROXY) {
       launchOptions.proxy = { server: PROXY };
     }
     
     browser = await chromium.launch(launchOptions);
-    logger.info({ headless: HEADLESS }, 'Browser launched');
+    logger.info({ 
+      headless: HEADLESS,
+      channel: USE_CHROME_CHANNEL ? 'chrome' : 'chromium'
+    }, 'Browser launched');
     
     // Pre-warm the pool
     logger.info({ poolSize: POOL_SIZE }, 'Pre-warming context pool...');
