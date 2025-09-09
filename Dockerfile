@@ -1,8 +1,9 @@
 FROM node:20-slim
 
-# Install dependencies for Chromium
+# Install dependencies for Chrome and Chromium
 RUN apt-get update && apt-get install -y \
     wget \
+    gnupg \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -40,15 +41,28 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Add Google Chrome repo and install Chrome stable
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
+# Skip browser download during npm install (we'll install manually)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 # Install Node dependencies
 RUN npm install --omit=dev --no-audit --no-fund
 
-# Install Playwright Chromium
+# Install Playwright dependencies for Chromium (shared libs)
+RUN npx playwright install-deps chromium
+
+# Install Chromium as fallback when not using Chrome channel
 RUN npx playwright install chromium
 
 # Copy application code
@@ -60,8 +74,10 @@ ENV HEADLESS=true
 ENV POOL_SIZE=3
 ENV NAV_TIMEOUT_MS=30000
 ENV SESSION_TTL_MS=300000
+ENV SESSION_MAX=100
 ENV CONCURRENCY_LIMIT=3
 ENV NODE_ENV=production
+ENV USE_CHROME_CHANNEL=false
 
 # Expose port
 EXPOSE 3000
