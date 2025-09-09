@@ -699,13 +699,12 @@ async function gracefulShutdown(signal) {
   
   // Close all sessions
   logger.info('Closing active sessions...');
-  for (const [sessionId, context] of sessions.entries()) {
-    await context.close().catch(err => 
+  for (const [sessionId, session] of sessions.entries()) {
+    await session.context.close().catch(err => 
       logger.error({ err: err.message, sessionId }, 'Error closing session')
     );
   }
   sessions.clear();
-  sessionLastAccess.clear();
   
   // Drain and close pool
   logger.info('Draining context pool...');
