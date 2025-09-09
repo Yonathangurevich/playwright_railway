@@ -5,8 +5,11 @@ const genericPool = require('generic-pool');
 const pino = require('pino');
 const crypto = require('crypto');
 
-// Apply stealth plugin
-chromium.use(StealthPlugin());
+// Configure and apply stealth plugin with all evasions
+const stealth = StealthPlugin();
+stealth.enabledEvasions.delete('iframe.contentWindow');
+stealth.enabledEvasions.delete('media.codecs');
+chromium.use(stealth);
 
 // Configuration from ENV
 const PORT = parseInt(process.env.PORT || '3000');
@@ -16,6 +19,10 @@ const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '300000');
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || '3');
 const PROXY = process.env.PROXY || null;
+
+// Default headers for stealth
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
 
 // Logger setup
 const logger = pino({
@@ -32,6 +39,14 @@ let browser = null;
 // Session management
 const sessions = new Map();
 const sessionLastAccess = new Map();
+
+// Utility: random delay
+const randomDelay = (min, max) => {
+  return new Promise(resolve => {
+    const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+    setTimeout(resolve, delay);
+  });
+};
 
 // Concurrency control semaphore
 class Semaphore {
@@ -65,10 +80,23 @@ const semaphore = new Semaphore(CONCURRENCY_LIMIT);
 const contextPool = genericPool.createPool({
   create: async () => {
     logger.debug('Creating new browser context');
-    const contextOptions = {};
+    const contextOptions = {
+      userAgent: DEFAULT_USER_AGENT,
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      viewport: { width: 1920, height: 1080 },
+      screen: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      extraHTTPHeaders: {
+        'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
+      }
+    };
+    
     if (PROXY) {
       contextOptions.proxy = { server: PROXY };
     }
+    
     return await browser.newContext(contextOptions);
   },
   destroy: async (context) => {
@@ -129,13 +157,20 @@ app.get('/healthz', (req, res) => {
 
 // Main solve endpoint
 app.post('/solve', async (req, res) => {
-  const { url, userAgent, cookies, waitUntil, sessionId, blockAssets = true } = req.body;
+  const { 
+    url, 
+    userAgent, 
+    cookies, 
+    waitUntil = 'domcontentloaded', 
+    sessionId, 
+    blockAssets = true 
+  } = req.body;
   
   if (!url) {
     return res.status(400).json({ error: 'url is required' });
   }
 
-  logger.info({ requestId: req.id, url, sessionId }, 'Solving URL');
+  logger.info({ requestId: req.id, url, sessionId, blockAssets }, 'Solving URL');
   
   let context = null;
   let page = null;
@@ -151,9 +186,21 @@ app.post('/solve', async (req, res) => {
         sessionLastAccess.set(sessionId, Date.now());
         logger.debug({ sessionId }, 'Reusing session context');
       } else {
-        // Create new session context
-        const contextOptions = {};
+        // Create new session context with stealth settings
+        const contextOptions = {
+          userAgent: userAgent || DEFAULT_USER_AGENT,
+          locale: 'en-US',
+          timezoneId: 'America/New_York',
+          viewport: { width: 1920, height: 1080 },
+          screen: { width: 1920, height: 1080 },
+          deviceScaleFactor: 1,
+          hasTouch: false,
+          extraHTTPHeaders: {
+            'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
+          }
+        };
         if (PROXY) contextOptions.proxy = { server: PROXY };
+        
         context = await browser.newContext(contextOptions);
         sessions.set(sessionId, context);
         sessionLastAccess.set(sessionId, Date.now());
@@ -168,33 +215,90 @@ app.post('/solve', async (req, res) => {
     // Create page
     page = await context.newPage();
     
-    // Set user agent if provided
-    if (userAgent) {
-      await page.setExtraHTTPHeaders({ 'User-Agent': userAgent });
+    // Set custom user agent if provided and not using session
+    if (userAgent && !sessionId) {
+      await page.setExtraHTTPHeaders({ 
+        'User-Agent': userAgent,
+        'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
+      });
     }
+    
+    // Set realistic headers
+    await page.setExtraHTTPHeaders({
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1'
+    });
     
     // Set cookies if provided
     if (cookies && Array.isArray(cookies)) {
-      await context.addCookies(cookies);
+      const formattedCookies = cookies.map(cookie => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path || '/',
+        httpOnly: cookie.httpOnly !== false,
+        secure: cookie.secure !== false,
+        sameSite: 'Lax'
+      }));
+      await context.addCookies(formattedCookies);
     }
     
-    // Asset blocking
+    // Enhanced asset blocking
     if (blockAssets) {
       await page.route('**/*', (route) => {
-        const type = route.request().resourceType();
-        if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+        const resourceType = route.request().resourceType();
+        const blockedTypes = ['image', 'media', 'font', 'stylesheet', 'websocket'];
+        
+        if (blockedTypes.includes(resourceType)) {
           route.abort();
         } else {
           route.continue();
         }
       });
+      logger.debug({ requestId: req.id }, 'Asset blocking enabled');
     }
     
     // Navigate with timeout
     const response = await page.goto(url, {
-      waitUntil: waitUntil || 'networkidle',
+      waitUntil: waitUntil,
       timeout: NAV_TIMEOUT_MS
     });
+    
+    // Add human-like behavior
+    try {
+      // Small random delay
+      await randomDelay(20, 80);
+      
+      // Tiny scroll to trigger lazy loading
+      await page.evaluate(() => {
+        window.scrollBy(0, Math.random() * 100 + 50);
+      });
+      
+      // Another small delay
+      await randomDelay(20, 80);
+      
+      // Scroll back up slightly
+      await page.evaluate(() => {
+        window.scrollBy(0, -(Math.random() * 30 + 10));
+      });
+      
+    } catch (err) {
+      // Ignore errors from human-like actions
+      logger.debug({ err: err.message }, 'Human-like action failed (non-critical)');
+    }
+    
+    // Wait a bit for any lazy-loaded content
+    await page.waitForTimeout(100);
     
     // Get final URL and HTML
     const finalUrl = page.url();
@@ -250,7 +354,7 @@ async function start() {
   try {
     logger.info('Starting scraper service...');
     
-    // Launch browser
+    // Launch browser with stealth-optimized args
     const launchOptions = {
       headless: HEADLESS,
       args: [
@@ -260,8 +364,13 @@ async function start() {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--disable-web-security',
+        '--disable-infobars'
       ]
     };
     
