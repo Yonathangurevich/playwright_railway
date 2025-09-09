@@ -1,0 +1,25 @@
+{
+  "name": "scraper-service",
+  "version": "1.0.0",
+  "description": "Self-hosted scraper service with Playwright-extra and stealth",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
+  "keywords": ["scraper", "playwright", "stealth", "railway"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.45.3",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "generic-pool": "^3.9.0",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
