@@ -60,7 +60,8 @@ const ErrorTypes = {
   PAGE_ERROR: (msg, hint) => new ServiceError('PAGE_ERROR', msg, hint),
   BROWSER_ERROR: (msg, hint) => new ServiceError('BROWSER_ERROR', msg, hint),
   INTERNAL: (msg, hint) => new ServiceError('INTERNAL', msg, hint),
-  CF_CHALLENGE: (msg, hint) => new ServiceError('CF_CHALLENGE', msg, hint)
+  CF_CHALLENGE: (msg, hint) => new ServiceError('CF_CHALLENGE', msg, hint),
+  CONTENT_NOT_READY: (msg, hint) => new ServiceError('CONTENT_NOT_READY', msg, hint)
 };
 
 // Utility: random delay
@@ -90,6 +91,68 @@ const needsCfHardening = (url, challengeMode) => {
     return false;
   }
 };
+
+// Helper: Check if page has Cloudflare challenge
+async function isChallenged(page) {
+  try {
+    const title = await page.title().catch(() => '');
+    if (/just a moment|checking your browser/i.test(title)) {
+      return true;
+    }
+    
+    const bodyText = await page.evaluate(() => 
+      document.body ? document.body.innerText.slice(0, 2000) : ''
+    ).catch(() => '');
+    
+    return /cf-browser-verification|cloudflare/i.test(bodyText);
+  } catch {
+    return false;
+  }
+}
+
+// Helper: Check if content is ready
+async function isContentReady(page, selector) {
+  try {
+    if (selector) {
+      // Use provided selector
+      const elementExists = await page.evaluate((sel) => {
+        return document.querySelector(sel) !== null;
+      }, selector);
+      return elementExists;
+    } else {
+      // Heuristic: check for sufficient content AND not challenged
+      const hasContent = await page.evaluate(() => {
+        const elements = document.querySelectorAll('a,div,section,table,ul,li');
+        return elements.length > 50;
+      });
+      
+      if (!hasContent) return false;
+      
+      // Also verify not challenged
+      const challenged = await isChallenged(page);
+      return !challenged;
+    }
+  } catch {
+    return false;
+  }
+}
+
+// Helper: Run humanization actions
+async function runHumanization(page, logger, requestId) {
+  try {
+    await page.mouse.move(200, 200, { steps: 4 });
+  } catch (err) {
+    logger.debug({ requestId, err: err.message }, 'Mouse move failed (non-critical)');
+  }
+  
+  try {
+    await page.evaluate(() => {
+      window.scrollBy(0, 120);
+    });
+  } catch (err) {
+    logger.debug({ requestId, err: err.message }, 'Scroll action failed (non-critical)');
+  }
+}
 
 // LRU eviction for sessions
 const evictLRUSession = async () => {
@@ -409,7 +472,10 @@ app.post('/solve', async (req, res) => {
     waitUntil, 
     sessionId, 
     blockAssets = true,
-    challengeMode = false 
+    challengeMode = false,
+    contentReadySelector = null,
+    postNavigateWaitMs = null,
+    maxChallengeRounds = 2
   } = req.body;
   
   // Input validation
@@ -439,8 +505,9 @@ app.post('/solve', async (req, res) => {
   
   // Override settings for CF-protected sites
   const effectiveBlockAssets = cfHardening ? false : blockAssets;
-  const effectiveWaitUntil = cfHardening ? (waitUntil || 'networkidle') : (waitUntil || 'domcontentloaded');
+  const effectiveWaitUntil = cfHardening ? (waitUntil || 'domcontentloaded') : (waitUntil || 'domcontentloaded');
   const effectiveUserAgent = userAgent || DEFAULT_USER_AGENT;
+  const effectivePostNavigateWait = postNavigateWaitMs !== null ? postNavigateWaitMs : (600 + Math.floor(Math.random() * 800));
 
   logger.info({ 
     requestId: req.id, 
@@ -451,6 +518,9 @@ app.post('/solve', async (req, res) => {
     waitUntil: effectiveWaitUntil,
     challengeMode,
     cfHardening,
+    contentReadySelector,
+    postNavigateWaitMs: effectivePostNavigateWait,
+    maxChallengeRounds,
     userAgent: userAgent ? 'custom' : 'default'
   }, 'Processing request');
   
@@ -624,148 +694,103 @@ app.post('/solve', async (req, res) => {
       );
     }
     
-    // Enhanced humanization for CF sites
-    if (cfHardening) {
-      // Longer wait for CF sites (600-1400ms)
-      await page.waitForTimeout(600 + Math.floor(Math.random() * 800));
+    // Post-navigation wait with jitter
+    await page.waitForTimeout(effectivePostNavigateWait);
+    logger.debug({ 
+      requestId: req.id, 
+      waitMs: effectivePostNavigateWait 
+    }, 'Post-navigation wait completed');
+    
+    // Initial humanization
+    await runHumanization(page, logger, req.id);
+    
+    // Check for Cloudflare challenge
+    let challenged = await isChallenged(page);
+    let challengeRounds = 0;
+    
+    if (challenged) {
+      logger.info({ 
+        requestId: req.id, 
+        hostname,
+        challenged: true
+      }, 'Cloudflare challenge detected');
       
-      // Human-like scroll
-      try {
-        await page.evaluate(() => window.scrollBy(0, 120));
-      } catch (err) {
-        logger.debug({ err: err.message }, 'Scroll action failed (non-critical)');
-      }
-      
-      // Small mouse movement
-      try {
-        await page.mouse.move(200, 200, { steps: 4 });
-      } catch (err) {
-        logger.debug({ err: err.message }, 'Mouse move failed (non-critical)');
-      }
-      
-      // Cloudflare challenge detection and wait loop
-      let challengeIterations = 0;
-      const maxChallengeIterations = 2;
-      
-      for (let i = 0; i < maxChallengeIterations; i++) {
-        // Check for CF challenge
-        const title = await page.title().catch(() => '');
-        const bodyText = await page.evaluate(() => 
-          document.body ? document.body.innerText.slice(0, 2000) : ''
-        ).catch(() => '');
+      // Challenge resolution loop
+      while (challenged && challengeRounds < maxChallengeRounds) {
+        challengeRounds++;
+        logger.info({ 
+          requestId: req.id,
+          round: challengeRounds,
+          maxRounds: maxChallengeRounds
+        }, 'Attempting to resolve CF challenge');
         
-        const challenged = /just a moment|checking your browser|cf-browser-verification/i.test(title + ' ' + bodyText);
+        // Wait for CF to process
+        await page.waitForTimeout(3500);
         
-        if (challenged) {
-          challengeIterations++;
+        // Try to wait for navigation
+        try {
+          await page.waitForNavigation({ 
+            waitUntil: 'domcontentloaded', 
+            timeout: 15000 
+          });
+        } catch (navErr) {
+          logger.debug({ 
+            requestId: req.id,
+            round: challengeRounds,
+            err: navErr.message
+          }, 'Navigation wait timeout (may be normal)');
+        }
+        
+        // Run humanization again
+        await runHumanization(page, logger, req.id);
+        
+        // Re-check if still challenged
+        challenged = await isChallenged(page);
+        
+        if (!challenged) {
           logger.info({ 
-            requestId: req.id, 
+            requestId: req.id,
             hostname,
-            iteration: challengeIterations
-          }, 'Cloudflare challenge detected, waiting...');
-          
-          // Wait for CF to process
-          await page.waitForTimeout(3500);
-          
-          // Try to wait for navigation
-          try {
-            await page.waitForNavigation({ 
-              waitUntil: 'networkidle', 
-              timeout: 15000 
-            });
-          } catch (navErr) {
-            logger.debug({ 
-              err: navErr.message,
-              iteration: challengeIterations
-            }, 'Navigation wait timeout (may be normal)');
-          }
-          
-          // Re-check if still challenged
-          const newTitle = await page.title().catch(() => '');
-          const newBodyText = await page.evaluate(() => 
-            document.body ? document.body.innerText.slice(0, 2000) : ''
-          ).catch(() => '');
-          
-          const stillChallenged = /just a moment|checking your browser|cf-browser-verification/i.test(newTitle + ' ' + newBodyText);
-          
-          if (!stillChallenged) {
-            logger.info({ 
-              requestId: req.id,
-              hostname,
-              iterations: challengeIterations
-            }, 'Cloudflare challenge cleared');
-            break;
-          }
-        } else {
-          // Not challenged, proceed
-          if (challengeIterations > 0) {
-            logger.info({ 
-              requestId: req.id,
-              hostname,
-              iterations: challengeIterations
-            }, 'Cloudflare challenge was already cleared');
-          }
+            roundsAttempted: challengeRounds
+          }, 'Cloudflare challenge cleared');
           break;
         }
       }
-      
-      // Final check if still challenged after max iterations
-      if (challengeIterations >= maxChallengeIterations) {
-        const finalTitle = await page.title().catch(() => '');
-        const finalBodyText = await page.evaluate(() => 
-          document.body ? document.body.innerText.slice(0, 2000) : ''
-        ).catch(() => '');
-        
-        const stillChallenged = /just a moment|checking your browser|cf-browser-verification/i.test(finalTitle + ' ' + finalBodyText);
-        
-        if (stillChallenged) {
-          throw ErrorTypes.CF_CHALLENGE(
-            'Cloudflare challenge could not be bypassed',
-            'Use residential proxy, longer NAV_TIMEOUT_MS, challengeMode:true, reuse sessionId'
-          );
-        }
-      }
-    } else {
-      // Standard humanization for non-CF sites
-      try {
-        // Small random delay
-        await randomDelay(20, 80);
-        
-        // Tiny scroll to trigger lazy loading
-        await page.evaluate(() => {
-          window.scrollBy(0, Math.random() * 100 + 50);
-        });
-        
-        // Another small delay
-        await randomDelay(20, 80);
-        
-        // Scroll back up slightly
-        await page.evaluate(() => {
-          window.scrollBy(0, -(Math.random() * 30 + 10));
-        });
-        
-      } catch (err) {
-        // Ignore errors from human-like actions
-        logger.debug({ err: err.message }, 'Human-like action failed (non-critical)');
-      }
     }
     
-    // Wait a bit for any lazy-loaded content
-    await page.waitForTimeout(100);
+    // Final content readiness check
+    const contentReady = await isContentReady(page, contentReadySelector);
+    const stillChallenged = await isChallenged(page);
     
-    // Get final URL and HTML
-    let finalUrl, html;
-    try {
-      finalUrl = page.url();
-      html = await page.content();
-    } catch (error) {
-      throw ErrorTypes.PAGE_ERROR(
-        'Failed to extract page content',
-        'Page may have been closed or navigated away unexpectedly'
+    logger.info({ 
+      requestId: req.id,
+      hostname,
+      challenged: stillChallenged,
+      contentReady,
+      selectorUsed: !!contentReadySelector,
+      selectorMatched: contentReadySelector ? contentReady : null,
+      roundsAttempted: challengeRounds
+    }, 'Content readiness check completed');
+    
+    // Determine final status
+    if (contentReady) {
+      // Content is ready - success
+      const finalUrl = page.url();
+      const html = await page.content();
+      return { finalUrl, html, status: 200 };
+    } else if (stillChallenged) {
+      // Still challenged after max rounds
+      throw ErrorTypes.CF_CHALLENGE(
+        'Cloudflare challenge could not be bypassed',
+        'Try residential proxy or reuse sessionId / longer NAV_TIMEOUT_MS'
+      );
+    } else {
+      // Content not ready but not challenged
+      throw ErrorTypes.CONTENT_NOT_READY(
+        'Content not ready',
+        'Adjust contentReadySelector or disable blockAssets'
       );
     }
-    
-    return { finalUrl, html, status: 200 };
   };
   
   try {
@@ -789,10 +814,12 @@ app.post('/solve', async (req, res) => {
       sessionsActive: sessions.size,
       poolAvailable: contextPool.available,
       cfHardening,
-      challengeMode
+      challengeMode,
+      contentReadySelector: !!contentReadySelector,
+      postNavigateWaitMs: effectivePostNavigateWait
     };
     
-    logger.info(metrics, 'Request completed');
+    logger.info(metrics, 'Request completed successfully');
     
     res.json({
       status: result.status,
@@ -827,11 +854,11 @@ app.post('/solve', async (req, res) => {
           break;
         case 'PAGE_ERROR':
         case 'BROWSER_ERROR':
+        case 'CONTENT_NOT_READY':
           statusCode = 502;
           break;
         case 'CF_CHALLENGE':
           statusCode = 403;
-          errorResponse.status = 403;
           break;
         default:
           statusCode = 500;
@@ -850,11 +877,7 @@ app.post('/solve', async (req, res) => {
       challengeMode
     }, 'Request failed');
     
-    // Include status in error response for CF_CHALLENGE
-    if (!errorResponse.status) {
-      errorResponse.status = statusCode;
-    }
-    
+    errorResponse.status = statusCode;
     res.status(statusCode).json(errorResponse);
     
   } finally {
