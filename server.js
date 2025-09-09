@@ -26,23 +26,6 @@ const REQUEST_TIMEOUT_MS = NAV_TIMEOUT_MS + 5000; // Server timeout buffer
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
 
-// Cloudflare-specific headers
-const CF_HEADERS = {
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Cache-Control': 'no-cache',
-  'Pragma': 'no-cache',
-  'Sec-Ch-Ua': '"Chromium";v="124", "Not.A/Brand";v="24", "Google Chrome";v="124"',
-  'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1'
-};
-
 // Logger setup
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -102,7 +85,7 @@ const needsCfHardening = (url, challengeMode) => {
   if (challengeMode) return true;
   try {
     const hostname = new URL(url).hostname.toLowerCase();
-    return /(partsouq\.com|cf|cloudflare)/i.test(hostname);
+    return /(partsouq\.com|cloudflare|cf)/i.test(hostname);
   } catch {
     return false;
   }
@@ -494,7 +477,7 @@ app.post('/solve', async (req, res) => {
       const existingSession = sessions.get(sessionId);
       
       if (existingSession) {
-        // Update last used time
+        // Update last used time (extend TTL)
         existingSession.lastUsedAt = Date.now();
         context = existingSession.context;
         logger.debug({ 
@@ -510,14 +493,14 @@ app.post('/solve', async (req, res) => {
         // Create new session context with CF-optimized settings
         const contextOptions = {
           userAgent: effectiveUserAgent,
-          locale: 'en-US',
-          timezoneId: cfHardening ? 'America/New_York' : 'America/New_York',
+          locale: cfHardening ? 'en-US' : 'en-US',
+          timezoneId: cfHardening ? 'UTC' : 'America/New_York',
           viewport: { width: 1920, height: 1080 },
           screen: { width: 1920, height: 1080 },
           deviceScaleFactor: 1,
           hasTouch: false,
-          extraHTTPHeaders: cfHardening ? CF_HEADERS : {
-            'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
+          extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9'
           }
         };
         if (PROXY) contextOptions.proxy = { server: PROXY };
@@ -544,11 +527,6 @@ app.post('/solve', async (req, res) => {
       // Use pooled context for non-session requests
       context = await contextPool.acquire();
       fromPool = true;
-      
-      // Apply CF headers if needed for pooled context
-      if (cfHardening) {
-        await context.setExtraHTTPHeaders(CF_HEADERS);
-      }
     }
     
     // Create page
@@ -557,15 +535,30 @@ app.post('/solve', async (req, res) => {
     // Set custom user agent if provided and not using session
     if (userAgent && !sessionId) {
       await page.setExtraHTTPHeaders({ 
-        'User-Agent': userAgent,
-        'Accept-Language': DEFAULT_ACCEPT_LANGUAGE
+        'User-Agent': userAgent
       });
     }
     
     // Set realistic headers based on CF hardening
     if (cfHardening) {
-      await page.setExtraHTTPHeaders(CF_HEADERS);
+      // Apply CF-specific headers
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Chromium";v="124", "Not.A/Brand";v="24", "Google Chrome";v="124"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
+      });
     } else {
+      // Standard headers
       await page.setExtraHTTPHeaders({
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -633,7 +626,7 @@ app.post('/solve', async (req, res) => {
     
     // Enhanced humanization for CF sites
     if (cfHardening) {
-      // Longer wait for CF sites
+      // Longer wait for CF sites (600-1400ms)
       await page.waitForTimeout(600 + Math.floor(Math.random() * 800));
       
       // Human-like scroll
@@ -654,20 +647,21 @@ app.post('/solve', async (req, res) => {
       let challengeIterations = 0;
       const maxChallengeIterations = 2;
       
-      while (challengeIterations < maxChallengeIterations) {
+      for (let i = 0; i < maxChallengeIterations; i++) {
         // Check for CF challenge
         const title = await page.title().catch(() => '');
         const bodyText = await page.evaluate(() => 
           document.body ? document.body.innerText.slice(0, 2000) : ''
         ).catch(() => '');
         
-        const challenged = /just a moment|checking your browser|cf-browser-verification|cloudflare/i.test(title + ' ' + bodyText);
+        const challenged = /just a moment|checking your browser|cf-browser-verification/i.test(title + ' ' + bodyText);
         
         if (challenged) {
+          challengeIterations++;
           logger.info({ 
             requestId: req.id, 
             hostname,
-            iteration: challengeIterations + 1
+            iteration: challengeIterations
           }, 'Cloudflare challenge detected, waiting...');
           
           // Wait for CF to process
@@ -682,37 +676,52 @@ app.post('/solve', async (req, res) => {
           } catch (navErr) {
             logger.debug({ 
               err: navErr.message,
-              iteration: challengeIterations + 1
+              iteration: challengeIterations
             }, 'Navigation wait timeout (may be normal)');
           }
           
-          challengeIterations++;
-        } else {
-          // Challenge cleared or not present
-          if (challengeIterations > 0) {
+          // Re-check if still challenged
+          const newTitle = await page.title().catch(() => '');
+          const newBodyText = await page.evaluate(() => 
+            document.body ? document.body.innerText.slice(0, 2000) : ''
+          ).catch(() => '');
+          
+          const stillChallenged = /just a moment|checking your browser|cf-browser-verification/i.test(newTitle + ' ' + newBodyText);
+          
+          if (!stillChallenged) {
             logger.info({ 
               requestId: req.id,
               hostname,
               iterations: challengeIterations
             }, 'Cloudflare challenge cleared');
+            break;
+          }
+        } else {
+          // Not challenged, proceed
+          if (challengeIterations > 0) {
+            logger.info({ 
+              requestId: req.id,
+              hostname,
+              iterations: challengeIterations
+            }, 'Cloudflare challenge was already cleared');
           }
           break;
         }
       }
       
-      // Final check if still challenged
+      // Final check if still challenged after max iterations
       if (challengeIterations >= maxChallengeIterations) {
         const finalTitle = await page.title().catch(() => '');
         const finalBodyText = await page.evaluate(() => 
           document.body ? document.body.innerText.slice(0, 2000) : ''
         ).catch(() => '');
         
-        const stillChallenged = /just a moment|checking your browser|cf-browser-verification|cloudflare/i.test(finalTitle + ' ' + finalBodyText);
+        const stillChallenged = /just a moment|checking your browser|cf-browser-verification/i.test(finalTitle + ' ' + finalBodyText);
         
         if (stillChallenged) {
           throw ErrorTypes.CF_CHALLENGE(
             'Cloudflare challenge could not be bypassed',
-            'Try using a residential proxy, enabling challengeMode, increasing NAV_TIMEOUT_MS, or reusing a sessionId'
+            'Use residential proxy, longer NAV_TIMEOUT_MS, challengeMode:true, reuse sessionId'
           );
         }
       }
@@ -756,7 +765,7 @@ app.post('/solve', async (req, res) => {
       );
     }
     
-    return { finalUrl, html, status: response?.status() || 200 };
+    return { finalUrl, html, status: 200 };
   };
   
   try {
@@ -786,8 +795,8 @@ app.post('/solve', async (req, res) => {
     logger.info(metrics, 'Request completed');
     
     res.json({
-      url: result.finalUrl,
       status: result.status,
+      url: result.finalUrl,
       html: result.html
     });
     
@@ -822,6 +831,7 @@ app.post('/solve', async (req, res) => {
           break;
         case 'CF_CHALLENGE':
           statusCode = 403;
+          errorResponse.status = 403;
           break;
         default:
           statusCode = 500;
@@ -839,6 +849,11 @@ app.post('/solve', async (req, res) => {
       cfHardening,
       challengeMode
     }, 'Request failed');
+    
+    // Include status in error response for CF_CHALLENGE
+    if (!errorResponse.status) {
+      errorResponse.status = statusCode;
+    }
     
     res.status(statusCode).json(errorResponse);
     
