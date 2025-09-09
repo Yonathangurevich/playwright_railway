@@ -19,9 +19,34 @@ const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '300000');
 const SESSION_MAX = parseInt(process.env.SESSION_MAX || '100');
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || '3');
-const PROXY = process.env.PROXY || null;
 const REQUEST_TIMEOUT_MS = NAV_TIMEOUT_MS + 5000; // Server timeout buffer
 const USE_CHROME_CHANNEL = process.env.USE_CHROME_CHANNEL === 'true';
+
+// Parse proxy URL into Playwright format
+function parseProxy(proxyUrl) {
+  try {
+    const url = new URL(proxyUrl);
+    const proxy = {
+      server: `${url.protocol}//${url.hostname}${url.port ? ':' + url.port : ''}`
+    };
+    
+    // Extract and decode credentials if present
+    if (url.username) {
+      proxy.username = decodeURIComponent(url.username);
+    }
+    if (url.password) {
+      proxy.password = decodeURIComponent(url.password);
+    }
+    
+    return proxy;
+  } catch (error) {
+    logger.error({ error: error.message, proxyUrl }, 'Failed to parse proxy URL');
+    return null;
+  }
+}
+
+// Parse proxy from environment
+const envProxy = process.env.PROXY ? parseProxy(process.env.PROXY) : null;
 
 // Default headers for stealth
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -62,7 +87,8 @@ const ErrorTypes = {
   BROWSER_ERROR: (msg, hint) => new ServiceError('BROWSER_ERROR', msg, hint),
   INTERNAL: (msg, hint) => new ServiceError('INTERNAL', msg, hint),
   CF_CHALLENGE: (msg, hint) => new ServiceError('CF_CHALLENGE', msg, hint),
-  CONTENT_NOT_READY: (msg, hint) => new ServiceError('CONTENT_NOT_READY', msg, hint)
+  CONTENT_NOT_READY: (msg, hint) => new ServiceError('CONTENT_NOT_READY', msg, hint),
+  PROXY_ERROR: (msg, hint) => new ServiceError('PROXY_ERROR', msg, hint)
 };
 
 // Utility: random delay
@@ -363,7 +389,7 @@ app.get('/version', (req, res) => {
     playwright: packageJson.dependencies.playwright,
     chromium: chromium._launcher?._browserPath || 'embedded',
     chromeChannel: USE_CHROME_CHANNEL,
-    usingProxy: !!PROXY,
+    usingProxy: !!(envProxy && envProxy.server),
     uptime: process.uptime(),
     env: process.env.NODE_ENV || 'production',
     ready: isReady
@@ -523,7 +549,7 @@ app.post('/solve', async (req, res) => {
     cfHardening,
     contentReadySelector,
     maxChallengeRounds,
-    usingProxy: !!PROXY,
+    usingProxy: !!(envProxy && envProxy.server),
     userAgent: userAgent ? 'custom' : 'default'
   }, 'Processing request');
   
@@ -676,6 +702,18 @@ app.post('/solve', async (req, res) => {
         timeout: NAV_TIMEOUT_MS
       });
     } catch (error) {
+      // Check if this might be a proxy error
+      if (envProxy && envProxy.server && 
+          (error.message.includes('net::ERR_PROXY_CONNECTION_FAILED') ||
+           error.message.includes('net::ERR_TUNNEL_CONNECTION_FAILED') ||
+           error.message.includes('proxy') ||
+           error.message.includes('ECONNREFUSED'))) {
+        throw ErrorTypes.PROXY_ERROR(
+          'Proxy connection failed',
+          'Check proxy server availability and credentials. Format: http://user:pass@host:port or socks5://host:port'
+        );
+      }
+      
       if (error.message.includes('timeout')) {
         throw ErrorTypes.TIMEOUT(
           `Navigation timeout after ${NAV_TIMEOUT_MS}ms`,
@@ -821,7 +859,7 @@ app.post('/solve', async (req, res) => {
       status: 200,
       gotCfClearance,
       cookies: maskedCookies,
-      usingProxy: !!PROXY
+      usingProxy: !!(envProxy && envProxy.server)
     };
   };
   
@@ -882,6 +920,9 @@ app.post('/solve', async (req, res) => {
         case 'CF_CHALLENGE':
           statusCode = 403;
           break;
+        case 'PROXY_ERROR':
+          statusCode = 502;
+          break;
         default:
           statusCode = 500;
       }
@@ -897,7 +938,7 @@ app.post('/solve', async (req, res) => {
       duration,
       cfHardening,
       challengeMode,
-      usingProxy: !!PROXY
+      usingProxy: !!(envProxy && envProxy.server)
     }, 'Request failed');
     
     errorResponse.status = statusCode;
@@ -923,40 +964,32 @@ async function start() {
   try {
     logger.info({ 
       chromeChannel: USE_CHROME_CHANNEL,
-      proxyEnabled: !!PROXY
+      proxyEnabled: !!(envProxy && envProxy.server)
     }, 'Starting scraper service...');
     
-    if (PROXY) {
-      logger.info(`Proxy enabled: ${PROXY}`);
+    if (envProxy && envProxy.server) {
+      logger.info(`Proxy enabled: ${envProxy.server} (auth: ${!!envProxy.username})`);
     }
     
-    // Build launch args
-    const launchArgs = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-      '--disable-blink-features=AutomationControlled',
-      '--hide-scrollbars',
-      '--mute-audio',
-      '--disable-web-security',
-      '--disable-infobars',
-      '--window-size=1920,1080',
-      '--start-maximized'
-    ];
-    
-    // Add proxy server if configured
-    if (PROXY) {
-      launchArgs.push(`--proxy-server=${PROXY}`);
-    }
-    
-    // Launch browser with stealth-optimized args
+    // Build launch options
     const launchOptions = {
       headless: HEADLESS,
-      args: launchArgs
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--disable-web-security',
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-maximized'
+      ]
     };
     
     // Use Chrome channel if configured
@@ -965,11 +998,16 @@ async function start() {
       logger.info('Using Chrome stable channel');
     }
     
+    // Add proxy configuration if available
+    if (envProxy) {
+      launchOptions.proxy = envProxy;
+    }
+    
     browser = await chromium.launch(launchOptions);
     logger.info({ 
       headless: HEADLESS,
       channel: USE_CHROME_CHANNEL ? 'chrome' : 'chromium',
-      proxyEnabled: !!PROXY
+      proxyEnabled: !!(envProxy && envProxy.server)
     }, 'Browser launched');
     
     // Pre-warm the pool
@@ -989,7 +1027,7 @@ async function start() {
     server = app.listen(PORT, '0.0.0.0', () => {
       logger.info({ 
         port: PORT,
-        proxyEnabled: !!PROXY
+        proxyEnabled: !!(envProxy && envProxy.server)
       }, 'Server listening and ready to accept traffic');
     });
     
